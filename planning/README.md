@@ -1,78 +1,40 @@
-# DocExplore - Project Planning
+# RAG cho kho tài liệu lớn và đa dạng
 
-## 1. Project Overview
+Tài liệu planning cho web app có tính năng chính là Retrieval-Augmented Generation (RAG): người dùng hỏi bằng ngôn ngữ tự nhiên, hệ thống truy xuất phần nội dung đáng tin cậy từ kho tài liệu dài, nhiều định dạng và trả lời kèm trích dẫn.
 
-DocExplore is a web-based document question-answering system using **Retrieval-Augmented Generation (RAG)**.
+## Mục tiêu sản phẩm
 
-The main goal is to allow users to upload, manage, search, and ask questions about a large collection of documents with different formats and contents.
+- Tìm đúng thông tin trong PDF, Word, PowerPoint, bảng tính, trang wiki và tài liệu scan.
+- Trả lời có nguồn dẫn, trang/đoạn liên quan và mức độ tin cậy.
+- Tôn trọng quyền truy cập theo người dùng, nhóm và tài liệu.
+- Đồng bộ thay đổi tài liệu mà không làm kết quả bị lỗi thời.
 
-The system retrieves relevant information from the document collection before generating an answer with an LLM. The answer should be grounded in the provided documents and include references to the original sources whenever possible.
+## Phạm vi MVP
 
-## 2. Problem
+1. Đăng nhập và quản lý quyền truy cập.
+2. Upload/kết nối nguồn tài liệu, theo dõi trạng thái ingest.
+3. Hybrid search: keyword search kết hợp vector search.
+4. Chat hỏi đáp có citation mở được đúng vị trí nguồn.
+5. Dashboard quản trị ingest, lỗi và feedback người dùng.
 
-Working with a large document collection creates several challenges:
+## Tài liệu liên quan
 
-* Documents can have different formats such as PDF, DOCX, XLSX, and PPTX.
-* Documents can be very long.
-* Some documents are scanned images and require OCR.
-* Important information may be stored in tables or complex layouts.
-* Naive text chunking can separate related information.
-* Searching only by semantic similarity may miss exact keywords.
-* Retrieved documents may contain irrelevant information.
-* Documents can be updated, duplicated, or conflicting.
-* The LLM may generate information that does not exist in the source documents.
-* Users need to know where an answer came from.
+- `features-pain-points-edge-cases.md`: Danh sách feature, pain point và edge case.
+- `solution-directions.md`: Hướng giải quyết và lộ trình triển khai.
+- `workflow.md`: Workflow RAG end-to-end bằng Mermaid.
 
-Therefore, the project focuses not only on building a chatbot, but also on designing a reliable document processing and retrieval pipeline.
+## Nguyên tắc thiết kế
 
-## 3. Planning Documents
+- Retrieval trước generation: chỉ trả lời khi có bằng chứng đủ tốt.
+- Security by design: luôn kiểm tra quyền trước khi trả dữ liệu cho người dùng.
+- Có thể đo lường: lưu trace, citation, feedback và benchmark.
+- Ưu tiên MVP có thể kiểm chứng trước khi mở rộng quy mô.
 
-### Features, Pain Points and Edge Cases
+## KPI gợi ý
 
-`features-pain-points-edge-cases.md`
-
-Defines the main system features, identifies important pain points, and lists edge cases that the system needs to handle.
-
-### Solution Directions
-
-`solution-directions.md`
-
-Proposes technical directions for solving the identified problems, including document processing, chunking, retrieval, reranking, grounding, citation, and document management.
-
-### System Workflow
-
-`workflow.mmd`
-
-Contains the proposed end-to-end workflow of the DocExplore RAG system using Mermaid.
-
-## 4. Main System Flow
-
-```text
-User
-  ↓
-Upload Documents
-  ↓
-Document Processing
-  ↓
-Text Extraction / OCR
-  ↓
-Chunking
-  ↓
-Embedding & Indexing
-  ↓
-User Query
-  ↓
-Retrieval
-  ↓
-Reranking
-  ↓
-Context Assembly
-  ↓
-LLM Generation
-  ↓
-Answer + Source Citation
-```
-
-## 5. Planning Goal
-
-The purpose of this planning phase is to define a practical architecture for a scalable and reliable RAG system before implementation begins.
+| Nhóm | Chỉ số |
+| --- | --- |
+| Retrieval | Recall@k, MRR, nDCG |
+| Câu trả lời | Citation precision, groundedness, tỷ lệ từ chối đúng |
+| Vận hành | Ingest success rate, p95 latency, thời gian cập nhật index |
+| Sản phẩm | Helpful-answer rate, tỷ lệ feedback tích cực |
