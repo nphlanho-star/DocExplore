@@ -3,7 +3,7 @@
 
 ## Frontend
 
-- **React**
+- **Streamlit**
   - Xây dựng giao diện web.
   - Bao gồm trang upload tài liệu, chat hỏi đáp, tìm kiếm và xem nguồn trích dẫn.
 
