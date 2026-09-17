@@ -22,7 +22,8 @@
 - Chatbot có thể trả lời sai nếu tìm không đúng tài liệu.
 - Một số tài liệu có nội dung bảo mật.
 - Xử lý nhiều file cùng lúc có thể chậm và tốn chi phí.
-- từ địa phương, sai chính tả, viết tắt.
+- Từ địa phương, sai chính tả, viết tắt.
+  
 ## Edge cases
 
 - File bị lỗi hoặc không mở được.
