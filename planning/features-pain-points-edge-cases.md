@@ -23,6 +23,9 @@
 - Một số tài liệu có nội dung bảo mật.
 - Xử lý nhiều file cùng lúc có thể chậm và tốn chi phí.
 - Từ địa phương, sai chính tả, viết tắt.
+- Tài liệu chứa bảng biểu, sơ đồ phức tạp dễ làm AI đọc sai cấu trúc.
+- Tài liệu thay đổi liên tục, hệ thống khó cập nhật theo thời gian thực.
+- Thiếu công cụ lưu vết, đánh giá xem chatbot trả lời tốt hay tệ.
   
 ## Edge cases
 
