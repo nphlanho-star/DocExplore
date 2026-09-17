@@ -89,10 +89,7 @@
 
 ## Large Language Model
 
-- **OpenAI GPT-4o**
-  - Dùng để sinh câu trả lời dựa trên các đoạn tài liệu được tìm thấy.
-  - Trả lời cần kèm citation hoặc tên nguồn tài liệu.
-  - Nếu không có đủ thông tin, model nên trả lời không tìm thấy thay vì tự đoán.
+  - qwen3.5: 2b (ollama)
 
 ## Tổng quan luồng dữ liệu
 
