@@ -49,13 +49,7 @@
   - Ví dụ: tài khoản người dùng, metadata file, trạng thái xử lý, quyền truy cập, lịch sử chat và feedback.
   - Không dùng PostgreSQL để lưu file vật lý.
 
-## Vector Database
 
-- **Qdrant**
-  - Lưu embedding của các đoạn tài liệu.
-  - Hỗ trợ vector search, hybrid search và metadata filtering.
-  - Có thể filter theo loại file, phòng ban, ngày upload hoặc quyền người dùng.
-  - Phù hợp khi số lượng tài liệu tăng lớn.
 
 ## Embedding Model
 
