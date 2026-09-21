@@ -3,9 +3,10 @@
 
 ## Frontend
 
-- **Streamlit**
-  - Xây dựng giao diện web.
-  - Bao gồm trang upload tài liệu, chat hỏi đáp, tìm kiếm và xem nguồn trích dẫn.
+- **React**
+  - Frontend được phát triển dựa trên React, sử dụng mô hình component-based để xây dựng giao diện linh hoạt và dễ mở rộng.
+  - Có thể phát triển theo các hướng tương tự như ReactPy hoặc Reflex khi muốn sử dụng Python thay cho JavaScript.
+  - Frontend chịu trách nhiệm hiển thị giao diện, xử lý tương tác người dùng và kết nối với Backend thông qua API.
 
 ## Backend API
 
