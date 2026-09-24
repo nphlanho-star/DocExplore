@@ -1,0 +1,77 @@
+# ── GENESIS client (đừng xóa dòng này) ─────────────────────────────
+.agentbox/.project-auth
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment / secrets ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── Pytest / Coverage ────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Mypy / Ruff / Linters ────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / Frontend ───────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+*.tsbuildinfo
+
+# ── Docker volumes (local bind mounts) ───────────────────────────────
+docker-data/
+postgres_data/
+minio_data/
+qdrant_data/
+redis_data/
+
+# ── ML model cache ───────────────────────────────────────────────────
+# HuggingFace cache (BGE-M3, reranker)
+.cache/
+models/
+
+# ── Alembic ───────────────────────────────────────────────────────────
+# Chỉ ignore file auto-generated, KHÔNG ignore versions/
+backend/alembic/versions/__pycache__/
+
+# ── IDE ───────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Temp / OCR intermediate ──────────────────────────────────────────
+tmp/
+temp/
