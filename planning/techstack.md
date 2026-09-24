@@ -84,7 +84,7 @@
 
 ## Large Language Model
 
-  - qwen3.5: 2b (ollama)
+  - qwen3.5: 0.8b (ollama)
 
 ## Tổng quan luồng dữ liệu
 
