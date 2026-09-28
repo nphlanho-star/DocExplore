@@ -1,46 +1,48 @@
 """
-services/minio_service.py — Upload / download file từ MinIO.
+services/minio_service.py — Local filesystem storage (dev mode).
+
+Giữ nguyên interface như MinIO SDK để không phải sửa documents.py / tasks.py.
+Files được lưu vào: backend/storage/<bucket>/<user_id>/<doc_id>/<filename>
 """
-import io
+import shutil
 import uuid
 from pathlib import Path
 
-from minio import Minio
-from minio.error import S3Error
 from loguru import logger
 
 from app.config import get_settings
 
 settings = get_settings()
 
+# Thư mục gốc: D:\RAG-2\backend\storage\
+STORAGE_ROOT = Path(__file__).parent.parent.parent / "storage"
+
 
 class MinIOService:
+    """Local filesystem storage — development mode."""
+
     def __init__(self) -> None:
-        self._client = Minio(
-            settings.MINIO_ENDPOINT,
-            access_key=settings.MINIO_ACCESS_KEY,
-            secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE,
-        )
         self._ensure_buckets()
 
     # ── Private ───────────────────────────────────────────────────────
 
     def _ensure_buckets(self) -> None:
-        """Tạo bucket nếu chưa tồn tại khi khởi động."""
         for bucket in (
             settings.MINIO_BUCKET_ORIGINAL,
             settings.MINIO_BUCKET_PROCESSED,
             settings.MINIO_BUCKET_OCR,
         ):
-            if not self._client.bucket_exists(bucket):
-                self._client.make_bucket(bucket)
-                logger.info(f"Created MinIO bucket: {bucket}")
+            (STORAGE_ROOT / bucket).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Local storage sẵn sàng tại: {STORAGE_ROOT.resolve()}")
 
     @staticmethod
     def _build_object_name(user_id: uuid.UUID, doc_id: uuid.UUID, filename: str) -> str:
-        """Tổ chức object theo user/document để dễ quản lý."""
         return f"{user_id}/{doc_id}/{filename}"
+
+    def _object_path(self, bucket: str, object_name: str) -> Path:
+        p = STORAGE_ROOT / bucket / object_name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
 
     # ── Public ────────────────────────────────────────────────────────
 
@@ -53,16 +55,10 @@ class MinIOService:
         data: bytes,
         content_type: str = "application/octet-stream",
     ) -> str:
-        """Upload bytes lên MinIO, trả về object path."""
         object_name = self._build_object_name(user_id, doc_id, filename)
-        self._client.put_object(
-            bucket,
-            object_name,
-            io.BytesIO(data),
-            length=len(data),
-            content_type=content_type,
-        )
-        logger.debug(f"Uploaded {object_name} → bucket={bucket}")
+        path = self._object_path(bucket, object_name)
+        path.write_bytes(data)
+        logger.debug(f"Saved {len(data)} bytes → {path}")
         return object_name
 
     def upload_original(
@@ -108,37 +104,30 @@ class MinIOService:
         )
 
     def download_bytes(self, bucket: str, object_name: str) -> bytes:
-        """Tải nội dung file về dạng bytes."""
-        try:
-            response = self._client.get_object(bucket, object_name)
-            return response.read()
-        except S3Error as exc:
-            logger.error(f"MinIO download error: {exc}")
-            raise
+        path = self._object_path(bucket, object_name)
+        if not path.exists():
+            raise FileNotFoundError(f"Object không tồn tại: {bucket}/{object_name}")
+        data = path.read_bytes()
+        logger.debug(f"Read {len(data)} bytes ← {path}")
+        return data
 
     def download_original(self, object_name: str) -> bytes:
         return self.download_bytes(settings.MINIO_BUCKET_ORIGINAL, object_name)
 
     def delete_document(self, user_id: uuid.UUID, doc_id: uuid.UUID) -> None:
-        """Xóa tất cả object liên quan đến một document."""
-        prefix = f"{user_id}/{doc_id}/"
         for bucket in (
             settings.MINIO_BUCKET_ORIGINAL,
             settings.MINIO_BUCKET_PROCESSED,
             settings.MINIO_BUCKET_OCR,
         ):
-            objects = self._client.list_objects(bucket, prefix=prefix, recursive=True)
-            for obj in objects:
-                self._client.remove_object(bucket, obj.object_name)
-                logger.debug(f"Deleted {obj.object_name} from bucket={bucket}")
+            folder = STORAGE_ROOT / bucket / str(user_id) / str(doc_id)
+            if folder.exists():
+                shutil.rmtree(folder)
+                logger.debug(f"Deleted folder: {folder}")
 
     def get_presigned_url(self, bucket: str, object_name: str, expires_seconds: int = 3600) -> str:
-        """Tạo presigned URL để frontend tải trực tiếp từ MinIO."""
-        from datetime import timedelta
-        return self._client.presigned_get_object(
-            bucket, object_name, expires=timedelta(seconds=expires_seconds)
-        )
+        return f"http://localhost:8000/storage/{bucket}/{object_name}"
 
 
-# Singleton instance
+# Singleton
 minio_service = MinIOService()

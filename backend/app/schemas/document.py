@@ -43,3 +43,19 @@ class DocumentStatusResponse(BaseModel):
     status: str
     error_message: str | None
     processed_at: datetime | None
+
+
+class ChunkRead(BaseModel):
+    id: uuid.UUID
+    chunk_index: int
+    content: str
+    page_number: int | None
+    chunk_metadata: dict | None
+
+    model_config = {"from_attributes": True}
+
+
+class ChunkListResponse(BaseModel):
+    document_id: uuid.UUID
+    total: int
+    items: list[ChunkRead]

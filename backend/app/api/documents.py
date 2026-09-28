@@ -5,16 +5,18 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.config import get_settings
 from app.database import get_db
-from app.models.document import Document, ProcessingStatus
+from app.models.document import Document, DocumentChunk, ProcessingStatus
 from app.models.permission import Permission
 from app.models.user import User
 from app.schemas.document import (
+    ChunkListResponse,
     DocumentListResponse,
     DocumentRead,
     DocumentStatusResponse,
@@ -108,19 +110,33 @@ async def upload_document(
     db.add(doc)
     await db.flush()   # lấy doc.id
 
-    # Upload file gốc lên MinIO
-    minio_path = minio_service.upload_original(
-        user_id=current_user.id,
-        doc_id=doc.id,
-        filename=file.filename or "file",
-        data=file_bytes,
-        content_type=file.content_type or "application/octet-stream",
-    )
-    doc.minio_original_path = minio_path
+    # Upload file gốc lên Storage (LocalStack S3)
+    try:
+        minio_path = minio_service.upload_original(
+            user_id=current_user.id,
+            doc_id=doc.id,
+            filename=file.filename or "file",
+            data=file_bytes,
+            content_type=file.content_type or "application/octet-stream",
+        )
+        doc.minio_original_path = minio_path
+    except Exception as exc:
+        logger.error(f"Storage upload failed: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Dịch vụ lưu trữ chưa sẵn sàng: {exc}",
+        )
 
     # Gửi Celery task (bất đồng bộ)
-    task = process_document_pipeline.delay(str(doc.id))
-    doc.celery_task_id = task.id
+    try:
+        task = process_document_pipeline.delay(str(doc.id))
+        doc.celery_task_id = task.id
+    except Exception as exc:
+        logger.error(f"Celery task dispatch failed: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Hàng đợi xử lý chưa sẵn sàng: {exc}",
+        )
 
     return DocumentUploadResponse(
         document_id=doc.id,
@@ -184,6 +200,24 @@ async def get_document_status(
         error_message=doc.error_message,
         processed_at=doc.processed_at,
     )
+
+
+@router.get("/{document_id}/chunks", response_model=ChunkListResponse)
+async def list_document_chunks(
+    document_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Xem lại toàn bộ dữ liệu đã được chunking của một tài liệu (để kiểm tra chất lượng)."""
+    await _check_document_access(document_id, current_user, db)
+
+    result = await db.execute(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index)
+    )
+    chunks = result.scalars().all()
+    return ChunkListResponse(document_id=document_id, total=len(chunks), items=chunks)
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

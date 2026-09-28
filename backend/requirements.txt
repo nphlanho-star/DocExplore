@@ -31,6 +31,10 @@ paddlepaddle==2.6.2
 paddleocr==2.8.1
 Pillow==10.4.0
 
+# ── PyTorch — xem requirements-torch.txt ─────────────────────────────
+# torch được cài riêng qua requirements-torch.txt để chỉ định index URL
+# Chạy: pip install -r requirements-torch.txt TRƯỚC rồi mới chạy file này
+
 # ── RAG Framework ────────────────────────────────────────────────────
 llama-index==0.11.17
 llama-index-core==0.11.17
@@ -42,7 +46,6 @@ llama-index-llms-ollama==0.3.4
 FlagEmbedding==1.2.11
 sentence-transformers==3.1.1
 transformers==4.44.2
-torch==2.4.1
 
 # ── Vector Database ──────────────────────────────────────────────────
 qdrant-client==1.11.3
@@ -50,11 +53,13 @@ qdrant-client==1.11.3
 # ── Background Jobs ──────────────────────────────────────────────────
 celery==5.4.0
 redis==5.0.8
-flower==2.0.1          # Celery monitor UI (optional)
+flower==2.0.1
 
 # ── Utilities ────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 loguru==0.7.2
-tenacity==9.0.0
+tenacity==8.2.3
 aiofiles==24.1.0
-python-magic==0.4.27
+# platform-specific: Windows dùng binary, Linux dùng python-magic + libmagic1 (apt)
+python-magic-bin==0.4.14; sys_platform == "win32"
+python-magic; sys_platform != "win32"

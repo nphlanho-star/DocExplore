@@ -1,13 +1,10 @@
 """
 alembic/env.py — Cấu hình Alembic dùng models SQLAlchemy của dự án.
 """
-import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy import engine_from_config, pool
 
 # Import settings và Base để Alembic nhận diện tất cả models
 from app.config import get_settings
@@ -19,7 +16,7 @@ import app.models  # noqa: F401
 settings = get_settings()
 config = context.config
 
-# Ghi đè URL từ settings (dùng sync driver cho Alembic)
+# Ghi đè URL từ settings (dùng sync driver psycopg2 cho Alembic)
 config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)
 
 if config.config_file_name is not None:
@@ -41,26 +38,17 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-async def run_async_migrations() -> None:
-    """Chạy migrations dùng async engine."""
-    connectable = async_engine_from_config(
+def run_migrations_online() -> None:
+    """Chạy migrations dùng sync engine (psycopg2)."""
+    connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
-
-
-def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 if context.is_offline_mode():

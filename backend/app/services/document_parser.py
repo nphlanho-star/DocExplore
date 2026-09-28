@@ -32,13 +32,12 @@ class DocumentParserService:
     """Dùng Docling để extract text từ PDF, Word, Excel, PowerPoint."""
 
     # Các định dạng Docling hỗ trợ
+    # Lưu ý: InputFormat.XLSX không có trong docling 2.5.0
     SUPPORTED_FORMATS = {
         ".pdf": InputFormat.PDF,
         ".docx": InputFormat.DOCX,
         ".doc": InputFormat.DOCX,
         ".pptx": InputFormat.PPTX,
-        ".xlsx": InputFormat.XLSX,
-        ".xls": InputFormat.XLSX,
         ".txt": None,   # xử lý riêng, không cần Docling
     }
 

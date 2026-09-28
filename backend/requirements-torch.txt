@@ -1,0 +1,7 @@
+# PyTorch CPU-only cho Windows 64-bit
+# Tải nhẹ hơn ~1.5GB so với bản CUDA mặc định
+#
+# Nếu máy có GPU NVIDIA, thay bằng:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu

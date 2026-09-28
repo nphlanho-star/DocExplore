@@ -36,10 +36,15 @@ class RerankerService:
     def _load(self):
         if self._model is None:
             from FlagEmbedding import FlagReranker
-            logger.info(f"Đang tải reranker model: {settings.RERANKER_MODEL}")
+            logger.info(
+                f"Đang tải reranker model: {settings.RERANKER_MODEL} "
+                f"(device={settings.RERANKER_DEVICE})"
+            )
             self._model = FlagReranker(
                 settings.RERANKER_MODEL,
-                use_fp16=True,
+                # fp16 chỉ tăng tốc trên GPU; trên CPU thường chậm hơn fp32.
+                use_fp16=(settings.RERANKER_DEVICE != "cpu"),
+                device=settings.RERANKER_DEVICE,
             )
             logger.info("Reranker model đã sẵn sàng.")
         return self._model

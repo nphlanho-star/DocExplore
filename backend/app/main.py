@@ -1,6 +1,20 @@
 """
 main.py — FastAPI application entrypoint.
 """
+import os
+
+# ── Tắt kiểm tra mạng HuggingFace Hub (version-check) mỗi lần load model ──────
+# Phải set TRƯỚC bất kỳ import nào có thể kéo theo huggingface_hub/transformers,
+# nếu không request mạng ngầm có thể làm chậm/treo lúc load embedding/reranker.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import asyncio
+import sys
+
+# ── Windows fix: asyncpg cần SelectorEventLoop (không dùng ProactorEventLoop) ─
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.config import get_settings
-from app.database import engine, Base
+from app.database import engine, Base, AsyncSessionLocal
 from app.api.users import router as users_router
 from app.api.documents import router as documents_router
 from app.api.chat import router as chat_router
@@ -27,6 +41,23 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables sẵn sàng.")
+
+    # Tự tạo dev user nếu chưa có
+    from app.models.user import User
+    from sqlalchemy import select
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.email == "dev@local"))
+        if result.scalar_one_or_none() is None:
+            dev_user = User(
+                email="dev@local",
+                username="dev",
+                hashed_password="no-auth",
+                is_active=True,
+                is_admin=True,
+            )
+            db.add(dev_user)
+            await db.commit()
+            logger.info("Dev user 'dev@local' đã được tạo.")
 
     # Kiểm tra Ollama
     from app.services.llm_service import llm_service
@@ -59,7 +90,7 @@ app = FastAPI(
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:8080"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

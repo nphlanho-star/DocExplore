@@ -9,14 +9,28 @@ Pipeline sau khi upload:
       ├─ step_embed_chunks         (BGE-M3 batch embedding)
       └─ step_index_to_qdrant      (upsert vào Qdrant)
 """
+import os
+
+# ── Tắt kiểm tra mạng HuggingFace Hub (version-check) mỗi lần load model ──────
+# Phải set TRƯỚC bất kỳ import nào có thể kéo theo huggingface_hub/transformers.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import asyncio
+import sys
 import uuid
 from datetime import datetime, timezone
 
+# ── Windows fix: asyncio.run() trong Celery cần SelectorEventLoop ────────────
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from celery.utils.log import get_task_logger
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.workers.celery_app import celery_app
-from app.database import AsyncSessionLocal
+from app.config import get_settings
 from app.models.document import Document, DocumentChunk, ProcessingStatus
 from app.services.minio_service import minio_service
 from app.services.document_parser import document_parser
@@ -26,6 +40,15 @@ from app.services.embedding_service import embedding_service
 from app.services.qdrant_service import qdrant_service
 
 logger = get_task_logger(__name__)
+
+# ── Engine riêng cho Celery worker ────────────────────────────────────────────
+# Không dùng chung AsyncSessionLocal của FastAPI: mỗi task ở đây gọi asyncio.run()
+# tạo event loop MỚI, trong khi engine có connection pool tái sử dụng connection
+# giữa các loop → lỗi "Event loop is closed" / "attached to a different loop".
+# NullPool đảm bảo mỗi lần dùng xong connection sẽ đóng hẳn, không giữ lại pool.
+_settings = get_settings()
+_worker_engine = create_async_engine(_settings.DATABASE_URL, poolclass=NullPool)
+WorkerSessionLocal = async_sessionmaker(_worker_engine, expire_on_commit=False)
 
 
 # ── Helper: cập nhật trạng thái document trong DB ─────────────────────────────
@@ -38,7 +61,7 @@ def _sync_update_status(doc_id: str, status: str, error: str | None = None) -> N
     import asyncio
 
     async def _update():
-        async with AsyncSessionLocal() as session:
+        async with WorkerSessionLocal() as session:
             values = {"status": status}
             if error:
                 values["error_message"] = error
@@ -59,7 +82,7 @@ def _sync_get_document(doc_id: str) -> dict:
     import asyncio
 
     async def _fetch():
-        async with AsyncSessionLocal() as session:
+        async with WorkerSessionLocal() as session:
             result = await session.execute(
                 select(Document).where(Document.id == uuid.UUID(doc_id))
             )
@@ -82,7 +105,7 @@ def _sync_save_chunks(doc_id: str, chunks_data: list[dict]) -> list[str]:
     import asyncio
 
     async def _save():
-        async with AsyncSessionLocal() as session:
+        async with WorkerSessionLocal() as session:
             chunk_ids = []
             for c in chunks_data:
                 chunk = DocumentChunk(
@@ -144,6 +167,10 @@ def process_document_pipeline(self, document_id: str) -> dict:
             # ocr_service.process_docx() trả None nếu không có ảnh → skip
             if ocr_result is not None:
                 final_text = ocr_service.merge_ocr_into_text(base_text, ocr_result)
+                # Gộp cả vào markdown_text — đây mới là nguồn chính dùng để
+                # chunking (chunk_document ưu tiên markdown_text). Trước đây
+                # chỉ gộp vào final_text nên chữ OCR bị bỏ sót khi index.
+                markdown_text = ocr_service.merge_ocr_into_text(markdown_text, ocr_result)
                 # Lưu kết quả OCR lên MinIO
                 minio_service.upload_ocr_result(
                     uuid.UUID(doc["owner_id"]),
@@ -167,9 +194,13 @@ def process_document_pipeline(self, document_id: str) -> dict:
         )
 
         # ── Bước 4: Chunking ──────────────────────────────────────────
+        # chunk_document() tự chọn chiến lược phù hợp nhất theo thứ tự ưu
+        # tiên: cấu trúc luật (Chương/Điều/Khoản) → heading Markdown →
+        # cắt toàn văn bản theo câu.
         logger.info("[4/5] Chunking…")
-        chunks = chunking_service.chunk_by_markdown_sections(
+        chunks = chunking_service.chunk_document(
             markdown_text=markdown_text,
+            plain_text=final_text,
             document_id=uuid.UUID(document_id),
             extra_metadata={
                 "original_filename": doc["original_filename"],
@@ -177,17 +208,6 @@ def process_document_pipeline(self, document_id: str) -> dict:
                 "owner_id": doc["owner_id"],
             },
         )
-
-        if not chunks:
-            # Fallback: chunk text thuần nếu markdown rỗng
-            chunks = chunking_service.chunk_text(
-                text=final_text,
-                document_id=uuid.UUID(document_id),
-                extra_metadata={
-                    "original_filename": doc["original_filename"],
-                    "owner_id": doc["owner_id"],
-                },
-            )
 
         logger.info(f"  {len(chunks)} chunk được tạo.")
 

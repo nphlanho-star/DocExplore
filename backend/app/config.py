@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     # ── Reranker (bge-reranker-v2-m3) ────────────────────────────────
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
     RERANKER_TOP_K: int = 5
+    # Tách riêng khỏi EMBEDDING_DEVICE để có thể "vừa CPU vừa GPU": ví dụ
+    # embedding chạy GPU (indexing hàng loạt, lợi nhiều về tốc độ) trong khi
+    # reranker chạy CPU (chỉ vài chục chunk mỗi query, không cần GPU, đỡ
+    # tốn VRAM cho GPU nhỏ chạy chung với Ollama).
+    RERANKER_DEVICE: str = "cpu"   # "cuda" nếu muốn reranker cũng dùng GPU
 
     # ── Ollama / LLM ─────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -85,7 +90,7 @@ class Settings(BaseSettings):
     # ── Upload ────────────────────────────────────────────────────────
     MAX_FILE_SIZE_MB: int = 50
     ALLOWED_EXTENSIONS: list[str] = [
-        ".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".xls", ".txt",
+        ".pdf", ".docx", ".doc", ".pptx", ".txt",
     ]
 
 

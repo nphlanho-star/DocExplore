@@ -1,11 +1,13 @@
 """
 api/chat.py — Chat pipeline: query → retrieval → rerank → LLM → citation.
 """
+import json
 import uuid
 from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,6 +75,21 @@ async def _get_or_create_session(
     db.add(session)
     await db.flush()
     return session
+
+
+def _sources_from_ranked(ranked: list) -> list[dict]:
+    """Chuẩn hóa danh sách chunk đã rerank thành metadata nguồn (dict, JSON-safe)."""
+    return [
+        {
+            "document_id": str(c.payload.get("document_id")),
+            "document_name": c.payload.get("original_filename") or "",
+            "chunk_index": c.payload.get("chunk_index") or 0,
+            "page_number": c.payload.get("page_number"),
+            "content_snippet": c.content[:200],
+            "relevance_score": round(c.rerank_score, 4),
+        }
+        for c in ranked
+    ]
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -195,23 +212,100 @@ async def query_stream(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Streaming version — trả về từng token realtime qua Server-Sent Events.
+    Streaming version — trả lời qua Server-Sent Events, kèm các sự kiện trạng thái
+    ("status") để frontend hiển thị đang xử lý bước nào, sự kiện "sources" (nguồn
+    trích dẫn), nhiều sự kiện "token" (từng đoạn câu trả lời), và "done" khi xong.
+    Mỗi dòng SSE là 1 JSON: {"type": "...", ...}
     """
-    accessible = await _get_accessible_doc_ids(current_user, db)
-    search_doc_ids = body.document_ids or accessible
 
-    if not search_doc_ids:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không có tài liệu.")
-
-    query_vector = embedding_service.embed_query(body.question)
-    candidates = qdrant_service.search(query_vector, top_k=settings.RETRIEVAL_TOP_K, document_ids=search_doc_ids)
-    ranked = reranker_service.rerank(body.question, candidates, top_k=body.top_k)
-    ranked = reranker_service.filter_by_threshold(ranked)
+    def _sse(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
     async def event_stream() -> AsyncIterator[str]:
-        async for token in llm_service.answer_stream(body.question, ranked):
-            yield f"data: {token}\n\n"
-        yield "data: [DONE]\n\n"
+        try:
+            # ── Lấy danh sách document được phép ──────────────────────
+            if body.document_ids:
+                accessible = await _get_accessible_doc_ids(current_user, db)
+                accessible_set = set(accessible)
+                forbidden = [d for d in body.document_ids if d not in accessible_set]
+                if forbidden:
+                    yield _sse({"type": "error", "message": f"Không có quyền truy cập {len(forbidden)} tài liệu."})
+                    return
+                search_doc_ids = body.document_ids
+            else:
+                search_doc_ids = await _get_accessible_doc_ids(current_user, db)
+
+            if not search_doc_ids:
+                yield _sse({"type": "error", "message": "Bạn chưa có tài liệu nào. Hãy upload tài liệu trước."})
+                return
+
+            # ── Retrieval ──────────────────────────────────────────────
+            yield _sse({"type": "status", "stage": "embed", "message": "Đang phân tích câu hỏi…"})
+            query_vector = embedding_service.embed_query(body.question)
+
+            yield _sse({"type": "status", "stage": "retrieval", "message": "Đang tìm kiếm đoạn tài liệu liên quan…"})
+            candidates = qdrant_service.search(
+                query_vector=query_vector,
+                top_k=settings.RETRIEVAL_TOP_K,
+                document_ids=search_doc_ids,
+                user_id=current_user.id,
+            )
+
+            yield _sse({
+                "type": "status",
+                "stage": "rerank",
+                "message": f"Đang xếp hạng {len(candidates)} đoạn tìm được…",
+            })
+            ranked = reranker_service.rerank(body.question, candidates, top_k=body.top_k)
+            ranked = reranker_service.filter_by_threshold(ranked, threshold=0.3)
+
+            sources = _sources_from_ranked(ranked)
+            yield _sse({"type": "sources", "sources": sources})
+
+            doc_names = ", ".join(sorted({s["document_name"] for s in sources if s["document_name"]})) or "tài liệu"
+            yield _sse({
+                "type": "status",
+                "stage": "generate",
+                "message": f"Đang đọc {doc_names} và soạn câu trả lời…",
+            })
+
+            # ── Sinh câu trả lời (streaming) ──────────────────────────
+            full_answer = ""
+            async for token in llm_service.answer_stream(body.question, ranked):
+                full_answer += token
+                yield _sse({"type": "token", "content": token})
+
+            if not full_answer:
+                full_answer = "Tôi không tìm thấy thông tin liên quan trong tài liệu."
+
+            # ── Lưu lịch sử chat ───────────────────────────────────────
+            chat_session = await _get_or_create_session(body.session_id, current_user, db)
+            db.add(ChatMessage(session_id=chat_session.id, role="user", content=body.question))
+            assistant_msg = ChatMessage(
+                session_id=chat_session.id,
+                role="assistant",
+                content=full_answer,
+                sources=sources,
+                retrieval_metadata={
+                    "candidates_count": len(candidates),
+                    "ranked_count": len(ranked),
+                    "model": llm_service._model,
+                },
+            )
+            db.add(assistant_msg)
+            await db.flush()
+            if not chat_session.title:
+                chat_session.title = body.question[:80]
+
+            yield _sse({
+                "type": "done",
+                "session_id": str(chat_session.id),
+                "message_id": str(assistant_msg.id),
+            })
+
+        except Exception as exc:
+            logger.error(f"[chat.query_stream] Lỗi: {exc}")
+            yield _sse({"type": "error", "message": str(exc)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

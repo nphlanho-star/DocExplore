@@ -1,0 +1,20 @@
+# ── Packages nặng — cache lâu dài, ít thay đổi ──────────────────────
+
+# Document Parser
+docling==2.5.0
+
+# OCR
+paddlepaddle==2.6.2
+paddleocr==2.8.1
+
+# RAG Framework
+llama-index==0.11.17
+llama-index-core==0.11.17
+llama-index-vector-stores-qdrant==0.3.3
+llama-index-embeddings-huggingface==0.3.1
+llama-index-llms-ollama==0.3.4
+
+# Embedding & Reranker
+FlagEmbedding==1.2.11
+sentence-transformers==3.1.1
+transformers==4.44.2

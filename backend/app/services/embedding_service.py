@@ -26,7 +26,9 @@ class EmbeddingService:
             logger.info(f"Đang tải embedding model: {settings.EMBEDDING_MODEL}")
             self._model = BGEM3FlagModel(
                 settings.EMBEDDING_MODEL,
-                use_fp16=True,        # tiết kiệm VRAM/RAM
+                # fp16 chỉ tăng tốc trên GPU (tensor core); trên CPU nó thường
+                # CHẬM hơn fp32 (không có nhân tăng tốc), có thể gây "treo" lâu.
+                use_fp16=(settings.EMBEDDING_DEVICE != "cpu"),
                 device=settings.EMBEDDING_DEVICE,
             )
             logger.info("Embedding model đã sẵn sàng.")
