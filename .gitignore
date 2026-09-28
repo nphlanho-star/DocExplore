@@ -75,3 +75,10 @@ logs/
 # ── Temp / OCR intermediate ──────────────────────────────────────────
 tmp/
 temp/
+
+# ── Venv cũ / snapshot thừa ─────────────────────────────────────────────
+.venv~/
+**/.venv~/
+
+# ── File người dùng upload (dữ liệu thật, không phải code) ──────────────
+backend/storage/
