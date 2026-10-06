@@ -91,7 +91,7 @@ alembic upgrade head
 
 ```bash
 # Cài Ollama: https://ollama.com/download
-ollama pull qwen2.5:0.5b
+ollama pull qwen2.5:3b
 ```
 
 Model BGE-M3 và reranker sẽ tự download từ HuggingFace khi khởi động lần đầu (~2GB).
@@ -282,7 +282,7 @@ Câu trả lời + Citation (tên file, trang, đoạn trích)
 | Biến | Mặc định | Mô tả |
 |------|----------|-------|
 | `SECRET_KEY` | ⚠️ Cần đổi | JWT signing key |
-| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Tên model trong Ollama |
+| `OLLAMA_MODEL` | `qwen2.5:3b` | Tên model trong Ollama |
 | `EMBEDDING_DEVICE` | `cpu` | `cpu` hoặc `cuda` |
 | `CHUNK_SIZE` | `512` | Số token mỗi chunk |
 | `RETRIEVAL_TOP_K` | `20` | Số chunk lấy từ Qdrant trước rerank |
