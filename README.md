@@ -1,187 +1,266 @@
-# RAG Document QA System
+# RAG Document QA — Hỏi đáp tài liệu pháp luật
 
-Hệ thống hỏi đáp tài liệu dựa trên RAG — FastAPI · LlamaIndex · BGE-M3 · Qdrant · Qwen · React.
+Hệ thống hỏi đáp tài liệu (tập trung văn bản luật tiếng Việt) dựa trên RAG.
+**Ưu tiên độ chính xác: chỉ trả lời từ tài liệu đã tải lên, không bịa; không có thông tin thì nói không có.**
+
+**Công nghệ:** FastAPI · Celery · PostgreSQL · Qdrant · BGE-M3 (dense + sparse) · bge-reranker-v2-m3 · Ollama (Qwen2.5) · Reflex (giao diện) · Tavily (tra cứu web, tùy chọn)
+
+---
+
+## Tính năng chính
+
+| Nhóm | Mô tả |
+|------|-------|
+| Tài liệu | Upload `.docx`/PDF… → Docling parse → chunk theo cấu trúc Chương/Điều → embedding → Qdrant. OCR (PaddleOCR) chỉ chạy khi file có ảnh nhúng |
+| Tìm kiếm | Hybrid Search (dense + sparse BGE-M3, gộp RRF, tùy chọn) → rerank bằng bge-reranker-v2-m3 → lọc theo ngưỡng điểm |
+| Hiểu yêu cầu | 1 lượt LLM phân loại: hỏi đáp / tóm tắt (N điều đầu, cuối, khoảng) / liệt kê các Điều / so sánh / làm rõ — kết quả được kiểm tra lại bằng code, sai thì quay về pipeline thường |
+| Chống ảo giác | Chỉ trả lời từ `<tai_lieu>`; từ chối khi điểm rerank thấp; chặn chữ Hán; chặn prompt injection; tìm theo Điều trực tiếp từ DB |
+| Nén context | Khi context vượt ngân sách, nén theo câu: giữ **nguyên văn** các câu liên quan nhất (chấm bằng reranker), không dùng LLM viết lại |
+| Bộ nhớ hội thoại | Mỗi lượt tiêu hao dần bộ nhớ; tới ~60–85% (ở chỗ hết ý) nén các lượt cũ thành ghi nhớ trích nguyên văn để về sau vẫn nhớ. Có chỉ báo % trên giao diện |
+| Lịch sử chat | Danh sách các cuộc trò chuyện, mở lại / xóa; nhớ file đang làm việc giữa các lượt |
+| Tra cứu web (tùy chọn) | Khi tài liệu không có thông tin **và** câu hỏi là về pháp luật → Tavily tìm trên các trang luật Việt Nam, hiển thị **nguyên văn đoạn trích + link** (không để LLM tóm tắt), có lọc lạc đề theo từng câu |
 
 ---
 
 ## Yêu cầu
 
-| Tool | Phiên bản tối thiểu |
-|------|---------------------|
-| Python | 3.11+ |
-| Docker + Docker Compose | 24+ |
-| Git | 2.x |
-| Ollama | Latest |
+| Công cụ | Ghi chú |
+|---------|---------|
+| Python 3.10+ | Dự án đang chạy trên Python 3.10 (Windows) |
+| PostgreSQL 16, Redis 7, Qdrant | Chạy bằng Docker Compose **hoặc** cài native (Memurai thay Redis trên Windows) |
+| Ollama | `ollama pull qwen2.5:3b` |
+| Git | |
+| GPU NVIDIA (khuyến nghị) | Dùng cho reranker (`RERANKER_DEVICE=cuda`) — rerank 20 đoạn trên CPU mất ~60 s, trên GPU chỉ vài giây |
+
+Cấu hình đã thử: laptop RTX 3050 4 GB, RAM 8 GB — xem mục [Máy yếu](#máy-yếu-8-gb-ram) bên dưới.
 
 ---
 
 ## Cài đặt lần đầu
 
-### 1. Clone repo
+### 1. Clone & tạo file cấu hình
 
 ```bash
 git clone <repo-url>
-cd <repo-name>
-```
-
-### 2. Cấu hình môi trường
-
-```bash
-cd backend
+cd RAG-2/backend
 cp .env.example .env
 ```
 
-Mở `.env` và chỉnh sửa ít nhất:
-
-```env
-# Tạo SECRET_KEY mới (bắt buộc khi production):
-# python -c "import secrets; print(secrets.token_hex(32))"
-SECRET_KEY=your_random_secret_here
-```
-
-### 3. Khởi động hạ tầng (PostgreSQL · Redis · MinIO · Qdrant)
+Mở `backend/.env` và chỉnh ít nhất `SECRET_KEY`:
 
 ```bash
-# Từ thư mục backend/
-docker compose up -d postgres redis minio qdrant
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Kiểm tra tất cả đều healthy:
+### 2. Hạ tầng (PostgreSQL · Redis · Qdrant)
 
 ```bash
-docker compose ps
+# từ thư mục backend/
+docker compose up -d postgres redis qdrant
+docker compose ps        # kiểm tra healthy
 ```
 
-### 4. Cài Python dependencies
+> Không dùng Docker: cài native PostgreSQL, Redis (Windows: Memurai) và Qdrant rồi trỏ `.env` tới đúng host/port.
+> File gốc được lưu ở thư mục `backend/storage/` (hệ thống file cục bộ, không cần MinIO).
+
+### 3. Python dependencies (backend)
 
 ```bash
-# Tạo virtual environment
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-source .venv/bin/activate
-
-# Cài packages
+source .venv/Scripts/activate        # Git Bash trên Windows
+# .venv\Scripts\activate             # CMD/PowerShell
+# source .venv/bin/activate          # macOS / Linux
 pip install -r requirements.txt
 ```
 
-> **Lưu ý PaddleOCR trên Windows:** nếu gặp lỗi khi cài `paddlepaddle`, dùng:
-> ```bash
-> pip install paddlepaddle -i https://pypi.tuna.tsinghua.edu.cn/simple
-> pip install paddleocr
-> ```
-
-### 5. Chạy database migrations
+**Dùng GPU cho reranker:** `requirements.txt` có thể cài torch bản CPU. Kiểm tra:
 
 ```bash
-# Từ thư mục backend/ (đã activate venv)
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+Nếu in `False` mà máy có GPU NVIDIA, cài torch bản CUDA:
+
+```bash
+pip uninstall -y torch
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+Sau đó đặt `RERANKER_DEVICE=cuda` trong `.env`.
+
+### 4. Migrations
+
+```bash
 alembic upgrade head
 ```
 
-> Lần đầu chạy sẽ tạo migration tự động từ models:
-> ```bash
-> alembic revision --autogenerate -m "init"
-> alembic upgrade head
-> ```
-
-### 6. Pull model LLM qua Ollama
+### 5. LLM
 
 ```bash
-# Cài Ollama: https://ollama.com/download
 ollama pull qwen2.5:3b
 ```
 
-Model BGE-M3 và reranker sẽ tự download từ HuggingFace khi khởi động lần đầu (~2GB).
+BGE-M3 và reranker tự tải từ HuggingFace ở lần chạy đầu (~2 GB mỗi model).
+
+### 6. Giao diện (Reflex)
+
+```bash
+cd ../frontend
+python -m venv .venv && source .venv/Scripts/activate
+pip install -r requirements.txt
+```
 
 ---
 
 ## Chạy ứng dụng
 
-Mở **3 terminal** riêng biệt (đều đã `cd backend` và activate venv):
+Mở các terminal riêng (backend đã activate venv):
 
-**Terminal 1 — FastAPI Backend:**
-
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-**Terminal 2 — Celery Worker (xử lý tài liệu bất đồng bộ):**
-
-```bash
-celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
-```
-
-**Terminal 3 — Flower (monitor Celery, tuỳ chọn):**
-
-```bash
-celery -A app.workers.celery_app flower --port=5555
-```
-
----
-
-## Chạy toàn bộ bằng Docker Compose (Production)
+**Terminal 1 — Backend API** (cổng 8000):
 
 ```bash
 cd backend
-docker compose up --build
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Tất cả services sẽ khởi động: PostgreSQL, Redis, MinIO, Qdrant, FastAPI, Celery worker, Flower.
+> ⚠️ **Không dùng `--reload` khi chạy thật**: mỗi lần lưu file sẽ nạp lại BGE-M3 + reranker, gây tăng RAM đột ngột
+> (lỗi Windows `os error 1455`). Chỉ bật `--reload` khi đang lập trình và máy dư RAM.
 
----
-
-## Endpoint quan trọng
-
-| Service | URL |
-|---------|-----|
-| API Docs (Swagger) | http://localhost:8000/docs |
-| API Docs (ReDoc) | http://localhost:8000/redoc |
-| MinIO Console | http://localhost:9001 |
-| Qdrant Dashboard | http://localhost:6333/dashboard |
-| Flower (Celery) | http://localhost:5555 |
-
----
-
-## Sử dụng nhanh qua API
-
-### Đăng ký & đăng nhập
+**Terminal 2 — Celery worker** (chỉ cần khi upload/xử lý tài liệu; tắt khi không dùng để tiết kiệm RAM):
 
 ```bash
-# Đăng ký
-curl -X POST http://localhost:8000/api/auth/register \
+cd backend
+celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+```
+
+(Windows: thêm `--pool=solo` nếu Celery báo lỗi tiến trình con.)
+
+**Terminal 3 — Giao diện:**
+
+```bash
+cd frontend
+reflex run
+```
+
+Mở http://localhost:3000. (Reflex backend nội bộ dùng cổng 8001 để không trùng FastAPI 8000.)
+
+**Lần đầu:** vào trang Dashboard → upload tài liệu → đợi trạng thái `ready` → sang trang chat đặt câu hỏi.
+
+### Chạy bằng Docker Compose
+
+`backend/docker-compose.yml` hiện chỉ dựng **PostgreSQL, Redis, Qdrant**. Backend, Celery và giao diện chạy native như trên.
+
+---
+
+## Xác thực (chế độ dev)
+
+Dự án đang ở **chế độ dev, không cần đăng nhập**: mọi request dùng một tài khoản `dev@local` được tạo tự động khi backend khởi động.
+Các endpoint `/api/auth/*` vẫn tồn tại nhưng không bắt buộc.
+**Không mở dịch vụ này ra Internet khi chưa bật xác thực thật.**
+
+---
+
+## Endpoint chính
+
+| Mục | URL |
+|-----|-----|
+| Swagger | http://localhost:8000/docs |
+| Upload tài liệu | `POST /api/documents/upload` |
+| Danh sách / chunk / xóa tài liệu | `GET /api/documents/`, `GET /api/documents/{id}/chunks`, `DELETE /api/documents/{id}` |
+| Hỏi đáp (streaming SSE) | `POST /api/chat/query/stream` |
+| Hỏi đáp (một lần) | `POST /api/chat/query` |
+| Phiên chat | `GET/POST /api/chat/sessions`, `GET/DELETE /api/chat/sessions/{id}` |
+| Qdrant dashboard | http://localhost:6333/dashboard |
+| Flower (tùy chọn) | `celery -A app.workers.celery_app flower --port=5555` → http://localhost:5555 |
+
+Ví dụ hỏi đáp:
+
+```bash
+curl -N -X POST http://localhost:8000/api/chat/query/stream \
   -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","username":"myuser","password":"password123"}'
-
-# Đăng nhập — lấy access token
-curl -X POST http://localhost:8000/api/auth/login \
-  -F "username=user@example.com" \
-  -F "password=password123"
+  -d '{"question": "Tóm tắt 10 điều đầu tiên của file P1", "top_k": 5}'
 ```
 
-### Upload tài liệu
+Các sự kiện SSE: `status`, `sources`, `token`, `memory` (mức bộ nhớ), `done`, `error`.
 
-```bash
-TOKEN="<access_token>"
+---
 
-curl -X POST http://localhost:8000/api/documents/upload \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@/path/to/document.docx"
+## Luồng xử lý
+
+### Tài liệu
+
+```
+Upload → validate → lưu file (backend/storage) + metadata (PostgreSQL)
+   → Celery: Docling parse → (có ảnh? PaddleOCR) → chunk theo Chương/Điều
+   → BGE-M3 embedding (dense + sparse) → Qdrant + PostgreSQL
 ```
 
 ### Hỏi đáp
 
-```bash
-curl -X POST http://localhost:8000/api/chat/query \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "Tóm tắt nội dung chính của tài liệu?",
-    "top_k": 5
-  }'
 ```
+Câu hỏi
+ ├─ chống injection / chào hỏi
+ ├─ Bộ hiểu yêu cầu (1 lượt LLM, kiểm tra lại bằng code): hỏi đáp | tóm tắt | liệt kê | so sánh | làm rõ
+ ├─ Phạm vi tài liệu (file nêu trong câu → file đang làm việc → tất cả)
+ ├─ Tìm kiếm: BGE-M3 (hybrid) → Qdrant top-K → rerank → lọc ngưỡng (RERANK_MIN_SCORE)
+ │     └─ không đủ tin cậy: HyDE thử lại (bỏ qua nếu điểm quá thấp = ngoài tài liệu)
+ ├─ Nén context theo câu (nếu vượt ngân sách)
+ ├─ Có context  → Qwen2.5 trả lời, kèm Điều/nguồn + ghi nhớ hội thoại
+ └─ Không có    → (nếu bật) hỏi luật? → Tavily → lọc theo câu → hiển thị nguyên văn + link
+                  (ngược lại) "Tôi không tìm thấy thông tin trong tài liệu"
+```
+
+---
+
+## Biến môi trường quan trọng (`backend/.env`)
+
+| Biến | Mặc định | Mô tả |
+|------|----------|-------|
+| `SECRET_KEY` | ⚠️ cần đổi | Khóa ký JWT |
+| `OLLAMA_MODEL` | `qwen2.5:3b` | Model trong Ollama |
+| `EMBEDDING_DEVICE` | `cpu` | `cpu` hoặc `cuda` |
+| `RERANKER_DEVICE` | `cpu` | `cuda` nếu torch có CUDA (rất khuyến nghị) |
+| `RERANK_MAX_LENGTH` | `384` | Số token tối đa mỗi cặp khi rerank (nhỏ hơn = nhanh hơn) |
+| `RETRIEVAL_TOP_K` | `20` | Số đoạn lấy từ Qdrant trước rerank (máy yếu: `10`) |
+| `RERANKER_TOP_K` | `5` | Số đoạn giữ lại sau rerank |
+| `RERANK_MIN_SCORE` | `0.15` | Dưới ngưỡng này coi như không có thông tin |
+| `HYBRID_SEARCH_ENABLED` | `false` | Bật dense + sparse. ⚠️ Bật lần đầu **xóa & tạo lại** collection Qdrant → phải upload lại tài liệu |
+| `HYDE_MIN_TOP_SCORE` | `0.03` | Điểm cao nhất dưới mức này → bỏ vòng HyDE (câu ngoài tài liệu) |
+| `CONTEXT_COMPRESS_ENABLED` | `true` | Nén context theo câu khi vượt ngân sách |
+| `MEMORY_BUDGET_CHARS` | `8000` | Ngân sách bộ nhớ hội thoại (ký tự) |
+| `MEMORY_COMPACT_MIN` / `MAX` | `0.60` / `0.85` | Khoảng mức đầy để nén bộ nhớ (nén ở chỗ hết ý) |
+| `MEMORY_KEEP_TURNS` | `2` | Số lượt gần nhất giữ nguyên văn khi buộc nén |
+| `MEMORY_SUMMARY_CHARS` | `1800` | Kích thước tối đa phần ghi nhớ sau nén |
+| `TAVILY_API_KEY` | _(trống)_ | Khóa Tavily — **chỉ ghi vào `.env`, không commit** |
+| `WEB_SEARCH_ENABLED` | `false` | Bật tra cứu web cho câu hỏi pháp luật ngoài tài liệu |
+| `WEB_SEARCH_DOMAINS` | các trang luật VN | Danh sách trang được phép tìm (phẩy ngăn cách) |
+| `WEB_SEARCH_DEPTH` | `basic` | `advanced` trích xuất tốt hơn nhưng tốn gấp đôi credit |
+| `WEB_MIN_RELEVANCE` / `WEB_SENTENCE_MIN` | `0.15` / `0.10` | Ngưỡng lọc nguồn/câu web lạc đề |
+| `MAX_FILE_SIZE_MB` | `50` | Giới hạn upload |
+
+Danh sách đầy đủ và giá trị mặc định: `backend/app/config.py`.
+
+---
+
+## Máy yếu (8 GB RAM)
+
+BGE-M3 và reranker mỗi cái ~2,2 GB, cộng Ollama ~2 GB nên RAM rất sát. Gợi ý:
+
+- Chạy backend **không** `--reload`; tắt Celery khi không upload.
+- `RERANKER_DEVICE=cuda` (cần torch CUDA) và `RETRIEVAL_TOP_K=10`.
+- Tăng pagefile Windows lên khoảng 16 GB nếu gặp `os error 1455` ("paging file is too small") rồi khởi động lại máy.
+- `ollama stop <model>` khi cần giải phóng bộ nhớ.
+
+## Xử lý sự cố
+
+| Triệu chứng | Cách xử lý |
+|-------------|------------|
+| `os error 1455` khi nạp reranker/embedding | Tăng pagefile, đóng bớt ứng dụng, bỏ `--reload`, tắt Celery |
+| Trả lời rất chậm | Xem log `[timing]`; thường là rerank trên CPU → dùng GPU hoặc giảm `RETRIEVAL_TOP_K` |
+| Nhiều câu hỏi bị "không tìm thấy" | Điểm rerank thấp: thử hạ `RERANK_MIN_SCORE` (VD `0.10`) |
+| Đổi `HYBRID_SEARCH_ENABLED` rồi không tìm được | Collection Qdrant đã tạo lại → upload lại tài liệu |
+| Web search không chạy | Cần cả `WEB_SEARCH_ENABLED=true` và `TAVILY_API_KEY`; câu hỏi phải là câu hỏi pháp luật; xem log `[web_search]` |
+| Nội dung web bị mất chữ "â" | Lỗi từ nguồn/Tavily; hệ thống tự sửa phần không thể nhầm, còn lại hãy mở link nguồn để đối chiếu |
 
 ---
 
@@ -189,102 +268,35 @@ curl -X POST http://localhost:8000/api/chat/query \
 
 ```
 backend/
-├── alembic/                    # Database migrations
-│   ├── env.py
-│   └── versions/
+├── alembic/                     # migrations
 ├── app/
-│   ├── main.py                 # FastAPI entrypoint
-│   ├── config.py               # Cấu hình qua .env
-│   ├── database.py             # SQLAlchemy async engine
-│   ├── models/                 # SQLAlchemy ORM models
-│   │   ├── user.py
-│   │   ├── document.py
-│   │   ├── chat.py
-│   │   ├── permission.py
-│   │   └── feedback.py
-│   ├── schemas/                # Pydantic request/response
-│   ├── services/               # Business logic
-│   │   ├── minio_service.py    # File storage
-│   │   ├── document_parser.py  # Docling
-│   │   ├── ocr_service.py      # PaddleOCR (chỉ khi cần)
-│   │   ├── chunking_service.py # LlamaIndex splitter
-│   │   ├── embedding_service.py# BGE-M3
-│   │   ├── qdrant_service.py   # Vector DB
-│   │   ├── reranker_service.py # BGE Reranker
-│   │   └── llm_service.py      # Ollama/Qwen
-│   ├── workers/                # Celery
-│   │   ├── celery_app.py
-│   │   └── tasks.py            # Document processing pipeline
-│   └── api/                    # FastAPI routes
-│       ├── deps.py             # JWT auth dependency
-│       ├── users.py
-│       ├── documents.py
-│       └── chat.py
-├── .env.example
-├── alembic.ini
-├── docker-compose.yml
-├── Dockerfile
-└── requirements.txt
+│   ├── main.py                  # FastAPI entrypoint (tạo dev user lúc khởi động)
+│   ├── config.py                # cấu hình qua .env
+│   ├── database.py              # SQLAlchemy async
+│   ├── models/                  # user, document, chat, permission, feedback
+│   ├── schemas/
+│   ├── api/                     # deps (dev user), users, documents, chat (pipeline hỏi đáp)
+│   ├── services/
+│   │   ├── document_parser.py   # Docling
+│   │   ├── ocr_service.py       # PaddleOCR (chỉ khi cần)
+│   │   ├── chunking_service.py  # chunk theo Chương/Điều
+│   │   ├── embedding_service.py # BGE-M3 (dense + sparse)
+│   │   ├── qdrant_service.py    # vector DB (dense / hybrid)
+│   │   ├── reranker_service.py  # bge-reranker-v2-m3 (+ chấm điểm câu cho nén/lọc web)
+│   │   ├── llm_service.py       # Ollama/Qwen: bộ hiểu yêu cầu, sinh câu trả lời
+│   │   ├── injection_guard.py   # chống prompt injection
+│   │   ├── tavily_service.py    # tra cứu web (tùy chọn)
+│   │   └── minio_service.py     # lưu file (hệ thống file cục bộ)
+│   └── workers/                 # Celery: xử lý tài liệu
+├── storage/                     # file gốc đã upload (không commit)
+├── docker-compose.yml           # postgres · redis · qdrant
+└── .env.example
+frontend/                        # Reflex: dashboard + trang chat
+planning/                        # tài liệu thiết kế, tech stack, edge case
 ```
 
----
+## Lưu ý bảo mật
 
-## Luồng xử lý tài liệu
-
-```
-Upload file
-    │
-    ▼
-FastAPI nhận + validate
-    │ lưu MinIO (file gốc)
-    │ lưu PostgreSQL (metadata)
-    ▼
-Celery Task (bất đồng bộ)
-    │
-    ├─[1] Docling parse → text + markdown
-    │
-    ├─[2] Detect ảnh nhúng (chỉ với .docx)
-    │       ├── Không có ảnh → bỏ qua PaddleOCR
-    │       └── Có ảnh       → PaddleOCR từng ảnh → merge vào text
-    │
-    ├─[3] Chunking (LlamaIndex SentenceSplitter)
-    │
-    ├─[4] BGE-M3 Embedding (batch)
-    │
-    └─[5] Qdrant upsert + PostgreSQL lưu chunks
-```
-
-## Luồng hỏi đáp
-
-```
-User gửi câu hỏi
-    │
-    ▼
-BGE-M3 tạo query embedding
-    │
-    ▼
-Qdrant search (filter theo quyền truy cập)
-    │  top-20 candidates
-    ▼
-bge-reranker-v2-m3 rerank
-    │  top-5 chunks liên quan nhất
-    ▼
-Qwen2.5 via Ollama (RAG prompt)
-    │
-    ▼
-Câu trả lời + Citation (tên file, trang, đoạn trích)
-```
-
----
-
-## Biến môi trường quan trọng
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `SECRET_KEY` | ⚠️ Cần đổi | JWT signing key |
-| `OLLAMA_MODEL` | `qwen2.5:3b` | Tên model trong Ollama |
-| `EMBEDDING_DEVICE` | `cpu` | `cpu` hoặc `cuda` |
-| `CHUNK_SIZE` | `512` | Số token mỗi chunk |
-| `RETRIEVAL_TOP_K` | `20` | Số chunk lấy từ Qdrant trước rerank |
-| `RERANKER_TOP_K` | `5` | Số chunk giữ lại sau rerank |
-| `MAX_FILE_SIZE_MB` | `50` | Giới hạn dung lượng upload |
+- `backend/.env` chứa khóa — đã được `.gitignore`; không commit, không dán lên nơi công khai. Nếu từng lộ `SECRET_KEY` hoặc API key thì tạo lại.
+- Chế độ dev không có đăng nhập: chỉ chạy trong mạng cục bộ.
+- Tra cứu web gửi câu hỏi của người dùng tới Tavily; kết quả web chỉ để tham khảo, **không phải tư vấn pháp lý** và cần đối chiếu văn bản gốc (văn bản có thể đã hết hiệu lực hoặc được thay thế).
