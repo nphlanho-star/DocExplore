@@ -87,7 +87,11 @@ class RerankerService:
         ]
 
         # Tính scores — trả về list[float]
-        scores: list[float] = model.compute_score(pairs, normalize=True)
+        scores = model.compute_score(
+            pairs, normalize=True, max_length=settings.RERANK_MAX_LENGTH, batch_size=8,
+        )
+        if not isinstance(scores, list):
+            scores = [scores]
 
         # Kết hợp và sắp xếp
         ranked: list[RankedChunk] = []
@@ -111,6 +115,16 @@ class RerankerService:
         )
 
         return top
+
+    def score_texts(self, query: str, texts: list[str]) -> list[float]:
+        """Điểm liên quan (0–1) giữa câu hỏi và từng đoạn văn bản bất kỳ (VD kết quả web)."""
+        if not texts:
+            return []
+        scores = self._load().compute_score(
+            [[query, tx] for tx in texts], normalize=True,
+            max_length=settings.RERANK_MAX_LENGTH, batch_size=8,
+        )
+        return [float(x) for x in (scores if isinstance(scores, list) else [scores])]
 
     def filter_by_threshold(
         self,

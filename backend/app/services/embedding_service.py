@@ -36,6 +36,64 @@ class EmbeddingService:
 
     # ── Public ────────────────────────────────────────────────────────
 
+    def embed_texts_with_sparse(
+        self, texts: list[str]
+    ) -> tuple[list[list[float]], list[dict[int, float]]]:
+        """
+        Tạo cả dense lẫn sparse (lexical) embedding cho danh sách text.
+
+        BGE-M3 hỗ trợ SPLADE-style sparse vectors qua ``return_sparse=True``.
+        Sparse vector biểu diễn trọng số theo từ vựng — phù hợp với văn bản
+        pháp luật có nhiều thuật ngữ kỹ thuật cố định ("quyền sở hữu",
+        "hộ gia đình"…) mà BM25-like matching bắt tốt hơn dense embedding.
+
+        Returns
+        -------
+        (dense_vectors, sparse_dicts)
+        dense_vectors : list[list[float]]  — mỗi vector shape (1024,)
+        sparse_dicts  : list[dict[int, float]]  — {token_id: weight}
+        """
+        if not texts:
+            return [], []
+
+        model = self._load()
+        batch_size = settings.EMBEDDING_BATCH_SIZE
+        all_dense: list[list[float]] = []
+        all_sparse: list[dict[int, float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            result = model.encode(
+                batch,
+                batch_size=len(batch),
+                max_length=8192,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+            )
+            dense: np.ndarray = result["dense_vecs"]
+            all_dense.extend(dense.tolist())
+
+            # lexical_weights: list[dict] mỗi phần tử là {token_id: weight}
+            sparse_batch = result.get("lexical_weights", [{} for _ in batch])
+            for sw in sparse_batch:
+                # Đảm bảo key là int, value là float
+                all_sparse.append({int(k): float(v) for k, v in sw.items()})
+
+            logger.debug(f"  Embedded (dense+sparse) batch {i // batch_size + 1}: {len(batch)} texts.")
+
+        logger.info(f"Đã tạo {len(all_dense)} embedding vectors (dense + sparse).")
+        return all_dense, all_sparse
+
+    def embed_query_with_sparse(
+        self, query: str
+    ) -> tuple[list[float], dict[int, float]]:
+        """Tạo cả dense lẫn sparse embedding cho một câu hỏi đơn."""
+        dense_list, sparse_list = self.embed_texts_with_sparse([query])
+        if not dense_list:
+            raise ValueError("Không thể tạo embedding cho query.")
+        return dense_list[0], sparse_list[0]
+
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """
         Tạo embedding cho danh sách text.

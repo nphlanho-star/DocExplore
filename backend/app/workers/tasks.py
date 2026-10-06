@@ -214,7 +214,15 @@ def process_document_pipeline(self, document_id: str) -> dict:
         # ── Bước 5: Embedding + Index vào Qdrant ──────────────────────
         logger.info("[5/5] Embedding + Qdrant indexing…")
         texts = [c.content for c in chunks]
-        vectors = embedding_service.embed_texts(texts)
+
+        if _settings.HYBRID_SEARCH_ENABLED:
+            # Tạo cả dense lẫn sparse vectors trong 1 lần encode (tiết kiệm thời gian
+            # hơn gọi 2 lần riêng lẻ vì model chỉ cần forward pass 1 lần).
+            logger.info("  Hybrid mode: tạo dense + sparse vectors…")
+            dense_vectors, sparse_vectors = embedding_service.embed_texts_with_sparse(texts)
+        else:
+            dense_vectors = embedding_service.embed_texts(texts)
+            sparse_vectors = None
 
         # Tạo UUID cho mỗi chunk (dùng làm Qdrant point ID)
         qdrant_ids = [str(uuid.uuid4()) for _ in chunks]
@@ -232,7 +240,7 @@ def process_document_pipeline(self, document_id: str) -> dict:
             for c in chunks
         ]
 
-        qdrant_service.index_chunks(qdrant_ids, vectors, payloads)
+        qdrant_service.index_chunks(qdrant_ids, dense_vectors, payloads, sparse_vectors=sparse_vectors)
 
         # Lưu chunk vào PostgreSQL
         chunks_data = [

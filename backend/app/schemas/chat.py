@@ -70,3 +70,4 @@ class ChatMessageRead(BaseModel):
 class ChatHistoryResponse(BaseModel):
     session: ChatSessionRead
     messages: list[ChatMessageRead]
+    memory_percent: int = 0   # mức đầy của bộ nhớ hội thoại (0–100)

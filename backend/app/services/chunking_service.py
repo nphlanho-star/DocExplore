@@ -29,6 +29,64 @@ CHUONG_RE = re.compile(r"^Chương\s+([IVXLCDM\d]+)[\.:\)]?\s*(.*)$", re.IGNOREC
 DIEU_RE = re.compile(r"^Điều\s+(\d+)[\.:]?\s*(.*)$", re.IGNORECASE)
 KHOAN_RE = re.compile(r"^(\d{1,2})[\.\)]\s+(.*)$")
 
+# ── Regex nhận diện loại văn bản từ dòng tiêu đề (preamble) ─────────────────
+# Dùng để gắn metadata "van_ban_type" vào mỗi chunk — giúp filter theo loại
+# khi người dùng hỏi "theo Nghị định nào" hay "Luật nào quy định".
+_VAN_BAN_TYPE_RE = re.compile(
+    r"\b(Luật|Bộ\s+luật|Nghị\s+định|Thông\s+tư|Quyết\s+định|Pháp\s+lệnh"
+    r"|Nghị\s+quyết|Chỉ\s+thị|Công\s+văn|Thông\s+báo)\b",
+    re.IGNORECASE,
+)
+# Năm ban hành từ dòng tiêu đề (VD: "năm 2023", "/2023/", "2023")
+_YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
+
+
+def _detect_van_ban_type(preamble_text: str) -> str | None:
+    """Trích loại văn bản từ đoạn mở đầu (tối đa 500 ký tự đầu)."""
+    sample = preamble_text[:500]
+    m = _VAN_BAN_TYPE_RE.search(sample)
+    if m:
+        return " ".join(m.group(0).split())  # chuẩn hóa khoảng trắng
+    return None
+
+
+def _detect_year(preamble_text: str) -> str | None:
+    """Trích năm ban hành từ đoạn mở đầu."""
+    sample = preamble_text[:500]
+    m = _YEAR_RE.search(sample)
+    return m.group(0) if m else None
+
+
+def _build_chunk_header(
+    chapter: str | None,
+    article_number: int | None,
+    article_title: str,
+) -> str:
+    """
+    Tạo header ngắn gọn gắn vào đầu mỗi chunk để embedding "biết" chunk này
+    thuộc Điều nào, Chương nào — giúp retrieval tốt hơn khi câu hỏi nhắc tên
+    Điều/Chương mà không có trong nội dung câu đó.
+
+    Ví dụ: "[Chương II] Điều 8 — Điều kiện được công nhận quyền sở hữu nhà ở"
+    """
+    parts: list[str] = []
+    if chapter:
+        # Lấy tên/số chương, bỏ phần mô tả dài
+        chapter_short = chapter.split("\n")[0].strip()
+        parts.append(f"[{chapter_short}]")
+    if article_number is not None:
+        # Bỏ phần "Điều X." hoặc "Điều X:" khỏi article_title để không lặp
+        clean_title = re.sub(
+            r"^Điều\s*\d+[a-zA-Z]?\s*[\.:\(]?\s*", "", article_title, flags=re.IGNORECASE
+        ).strip()
+        # Bỏ phần "(Tên điều)" nếu có dạng "Điều 8 (Tiêu đề):"
+        clean_title = re.sub(r"^[\(\[](.*?)[\)\]]$", r"\1", clean_title).strip()
+        if clean_title:
+            parts.append(f"Điều {article_number} — {clean_title}")
+        else:
+            parts.append(f"Điều {article_number}")
+    return " ".join(parts)
+
 
 @dataclass
 class ChunkData:
@@ -135,32 +193,61 @@ class ChunkingService:
 
         logger.info(f"Document {document_id}: phát hiện cấu trúc luật — {len(articles)} Điều.")
 
+        # ── Detect loại văn bản + năm từ preamble ───────────────────
+        preamble_text = "\n\n".join(preamble)
+        van_ban_type = _detect_van_ban_type(preamble_text)
+        van_ban_year = _detect_year(preamble_text)
+
         chunks: list[ChunkData] = []
         global_idx = 0
         threshold_chars = settings.CHUNK_SIZE * 4  # ước lượng ~4 ký tự / token
 
         # Đoạn mở đầu (căn cứ pháp lý, tiêu đề…) trước Điều 1 — vẫn giữ để tìm kiếm được.
         if preamble:
-            meta = {"chapter": None, "section": "preamble"}
+            meta: dict = {"chapter": None, "section": "preamble"}
+            if van_ban_type:
+                meta["van_ban_type"] = van_ban_type
+            if van_ban_year:
+                meta["van_ban_year"] = van_ban_year
             if extra_metadata:
                 meta.update(extra_metadata)
             chunks.append(
-                ChunkData(chunk_index=global_idx, content="\n\n".join(preamble), metadata=meta)
+                ChunkData(chunk_index=global_idx, content=preamble_text, metadata=meta)
             )
             global_idx += 1
 
         for art in articles:
             full_text = "\n\n".join(art["paragraphs"])
-            base_meta = {
+            base_meta: dict = {
                 "chapter": art["chapter"],
                 "article_number": art["article_number"],
                 "article_title": art["article_title"],
             }
+            if van_ban_type:
+                base_meta["van_ban_type"] = van_ban_type
+            if van_ban_year:
+                base_meta["van_ban_year"] = van_ban_year
             if extra_metadata:
                 base_meta.update(extra_metadata)
 
+            # ── Tạo context header để inject vào đầu chunk ──────────
+            # Header giúp embedding model "biết" chunk thuộc Điều/Chương nào,
+            # tăng khả năng match khi câu hỏi nhắc tên Điều mà không có trong nội dung.
+            header = _build_chunk_header(
+                chapter=art["chapter"],
+                article_number=art["article_number"],
+                article_title=art["article_title"],
+            )
+
+            def _with_header(text: str) -> str:
+                return f"{header}\n{text}" if header else text
+
             if len(full_text) <= threshold_chars:
-                chunks.append(ChunkData(chunk_index=global_idx, content=full_text, metadata=base_meta))
+                chunks.append(ChunkData(
+                    chunk_index=global_idx,
+                    content=_with_header(full_text),
+                    metadata=base_meta,
+                ))
                 global_idx += 1
                 continue
 
@@ -168,12 +255,20 @@ class ChunkingService:
             for unit_text, khoan_no in self._split_by_khoan(art["paragraphs"]):
                 unit_meta = {**base_meta, "khoan": khoan_no}
                 if len(unit_text) <= threshold_chars:
-                    chunks.append(ChunkData(chunk_index=global_idx, content=unit_text, metadata=unit_meta))
+                    chunks.append(ChunkData(
+                        chunk_index=global_idx,
+                        content=_with_header(unit_text),
+                        metadata=unit_meta,
+                    ))
                     global_idx += 1
                 else:
                     # Khoản vẫn quá dài → cắt tiếp bằng SentenceSplitter.
-                    for sub in self.chunk_text(unit_text, document_id, unit_meta):
+                    sub_chunks = self.chunk_text(unit_text, document_id, unit_meta)
+                    for j, sub in enumerate(sub_chunks):
                         sub.chunk_index = global_idx
+                        # Chỉ inject header vào chunk đầu tiên của Khoản
+                        if j == 0:
+                            sub.content = _with_header(sub.content)
                         chunks.append(sub)
                         global_idx += 1
 
