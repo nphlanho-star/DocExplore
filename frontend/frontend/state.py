@@ -30,6 +30,7 @@ class Message(BaseModel):
     role: str = "user"
     content: str = ""
     sources: list[Source] = []
+    tools_used: list[str] = []   # danh sách tên tool agent đã gọi (chỉ có ở assistant msg)
 
 
 class Document(BaseModel):
@@ -280,6 +281,12 @@ class AppState(rx.State):
     def set_query_suggest(self, q: str):
         self.query = q
 
+    async def copy_msg(self, content: str):
+        """Sao chép nội dung tin nhắn vào clipboard của trình duyệt."""
+        import json as _json
+        js = "navigator.clipboard.writeText(%s).catch(function(){})" % _json.dumps(content)
+        yield rx.call_script(js)
+
     def clear_chat(self):
         self.messages = []
         self.session_id = ""   # cuộc trò chuyện mới → không mang ngữ cảnh cũ sang
@@ -355,7 +362,12 @@ class AppState(rx.State):
         last = self.messages[-1]
         self.messages = [
             *self.messages[:-1],
-            Message(role="assistant", content=content, sources=sources if sources is not None else last.sources),
+            Message(
+                role="assistant",
+                content=content,
+                sources=sources if sources is not None else last.sources,
+                tools_used=last.tools_used,   # giữ tools_used
+            ),
         ]
 
     async def send_query(self):
@@ -441,7 +453,12 @@ class AppState(rx.State):
                                 last = self.messages[-1]
                                 self.messages = [
                                     *self.messages[:-1],
-                                    Message(role="assistant", content=last.content, sources=srcs),
+                                    Message(
+                                        role="assistant",
+                                        content=last.content,
+                                        sources=srcs,
+                                        tools_used=last.tools_used,   # giữ tools_used
+                                    ),
                                 ]
                             yield
 
@@ -467,7 +484,28 @@ class AppState(rx.State):
                                 last = self.messages[-1]
                                 self.messages = [
                                     *self.messages[:-1],
-                                    Message(role="assistant", content=last.content + token, sources=last.sources),
+                                    # Giữ tools_used đã set bởi event "tools_used" trước đó
+                                    Message(
+                                        role="assistant",
+                                        content=last.content + token,
+                                        sources=last.sources,
+                                        tools_used=last.tools_used,
+                                    ),
+                                ]
+                            yield
+
+                        elif etype == "tools_used":
+                            tlist = event.get("tools", [])
+                            if tlist and self.messages:
+                                last = self.messages[-1]
+                                self.messages = [
+                                    *self.messages[:-1],
+                                    Message(
+                                        role="assistant",
+                                        content=last.content,
+                                        sources=last.sources,
+                                        tools_used=tlist,
+                                    ),
                                 ]
                             yield
 

@@ -12,6 +12,27 @@ from loguru import logger
 from app.config import get_settings
 
 _URL = "https://api.tavily.com/search"
+
+# Loại bỏ đại từ nhân xưng / nghi vấn mang tính hội thoại trước khi gửi Tavily.
+# Mục đích: "nếu tôi đánh bài ăn tiền thì có vi phạm gì không"
+#   → "đánh bài ăn tiền vi phạm"
+# Tránh Tavily trả về diễn đàn Q&A / chia sẻ cá nhân thay vì văn bản pháp luật.
+_QUERY_STRIP_RE = re.compile(
+    r"(?:"
+    r"nếu\s+(?:tôi|mình|anh|chị|em|ông|bà|người\s+ta)\s+|"
+    r"(?:tôi|mình)\s+(?:muốn\s+biết|hỏi|cần\s+biết|thắc\s+mắc|xin\s+hỏi)\s*[,:—]?\s*|"
+    r"(?:cho|giúp)\s+(?:tôi|mình)\s+biết\s+|"
+    r"^(?:xin\s+hỏi|hỏi\s+về|hỏi|cho\s+hỏi)[,:—]?\s*"
+    r")",
+    re.I,
+)
+# Đuôi câu hỏi có thể lược bỏ an toàn (không mang thông tin pháp luật)
+_QUERY_TAIL_RE = re.compile(
+    r"\s*(?:thì\s+)?(?:có\s+)?(?:vi\s+phạm\s+(?:gì\s+)?không|phạm\s+(?:gì\s+)?không|bị\s+sao|thế\s+nào|được\s+không|"
+    r"hợp\s+pháp\s+không|đúng\s+không|có\s+đúng\s+không|có\s+phải\s+không|là\s+đúng\s+không)\s*\??$",
+    re.I,
+)
+
 _INJECT_HINT = re.compile(
     r"(ignore (?:(?:all|any|the|previous|prior|above|your)\s+)*instructions|disregard .{0,30}instructions|bỏ qua (?:(?:mọi|các|tất cả|toàn bộ)\s+)?(?:hướng dẫn|chỉ dẫn|lệnh)|system prompt|you are now)", re.I
 )
@@ -31,7 +52,7 @@ _JUNK = re.compile(
     r"xem thêm|bài viết liên quan|theo dõi chúng tôi|chia sẻ bài viết)",
     re.I,
 )
-_SENT_SPLIT = re.compile(r"(?<=[.;:!?])\s+(?=[A-ZÀ-Ỵ0-9(“\"\-+•])|\n+|\s*\[\.\.\.\]\s*")
+_SENT_SPLIT = re.compile(r'(?<=[.;:!?])\s+(?=[A-ZÀ-Ỵ0-9("\"\-+•])|\n+|\s*\[\.\.\.\]\s*')
 
 
 # ── Sửa lỗi mất chữ "â" do nguồn/Tavily (VD "hôn nhn", "quan tm", "xy dựng", "đy") ──────────────
@@ -87,6 +108,11 @@ def _tidy(text: str, limit: int, title: str = "") -> str:
     tách thành từng câu (mỗi dòng 1 câu) và cắt ở hết câu — không để câu đứt giữa chừng."""
     text = unicodedata.normalize("NFC", text)   # gộp ký tự tổ hợp → dấu tiếng Việt hiển thị đúng
     text = _repair_missing_circumflex_a(text)
+    # Xóa nội dung gạch ngang ~~...~~ (quy định cũ/đã bãi bỏ trên trang pháp luật).
+    # Loại bỏ nguyên cả khối để tránh: (1) chữ gạch render trong markdown,
+    # (2) nội dung cũ "dính" ngay sau nội dung mới gần giống nó.
+    text = re.sub(r"~~[^~\n]+~~", "", text)   # ~~một dòng, không qua newline~~
+    text = re.sub(r"~~", "", text)             # dọn ~~ lẻ còn sót
     text = re.sub(r"#{1,6}\s*", "\n", text)               # tiêu đề markdown giữa dòng → xuống dòng
     text = re.sub(r"([?!.;:])\s*\.(?=\s|$)", r"\1", text)   # "?." ".." ";." ":." → bỏ dấu chấm thừa
     text = re.sub(r"\s*…\s*$", "", text.strip())
@@ -118,7 +144,7 @@ def _tidy(text: str, limit: int, title: str = "") -> str:
     # Tavily hay chồng đoạn: câu bị cắt dở rồi câu sau lặp lại đoạn đuôi của nó → ghép lại thành 1 câu đầy đủ
     cleaned: list[str] = []
     for s in sents:
-        if cleaned and not cleaned[-1].endswith((".", ";", ":", "!", "?", "…", "”", '"')):
+        if cleaned and not cleaned[-1].endswith((".", ";", ":", "!", "?", "…", "\u201d", '"')):
             prev = cleaned[-1]
             for k in range(min(len(prev), len(s)), 14, -1):
                 if prev.lower().endswith(s[:k].lower()):
@@ -140,14 +166,29 @@ def is_enabled() -> bool:
     return bool(s.WEB_SEARCH_ENABLED and (s.TAVILY_API_KEY or "").strip())
 
 
+def _clean_query(q: str) -> str:
+    """Lược bỏ đại từ/nghi vấn hội thoại để Tavily tìm văn bản pháp luật thay vì diễn đàn Q&A.
+
+    Ví dụ:
+      "nếu tôi đánh bài ăn tiền thì có vi phạm gì không"
+      → "đánh bài ăn tiền"   (ngắn gọn, search-friendly)
+    """
+    q = _QUERY_STRIP_RE.sub("", q).strip()
+    q = _QUERY_TAIL_RE.sub("", q).strip()
+    # Nếu sau khi strip còn đủ dài, dùng bản đã strip; nếu quá ngắn (< 5 ký tự) dùng gốc
+    return q if len(q) >= 5 else q
+
+
 async def search_legal(query: str) -> list[WebResult]:
     s = get_settings()
     if not is_enabled():
         return []
+    search_q = _clean_query(query)
+    logger.info(f"[web_search] query gốc: {query[:80]!r} → query tìm: {search_q[:80]!r}")
     domains = [d.strip() for d in s.WEB_SEARCH_DOMAINS.split(",") if d.strip()]
     payload = {
         "api_key": s.TAVILY_API_KEY.strip(),
-        "query": query[:380],
+        "query": search_q[:380],
         "search_depth": s.WEB_SEARCH_DEPTH,
         "max_results": s.WEB_SEARCH_MAX_RESULTS,
         "include_answer": False,

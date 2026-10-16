@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     # → bỏ qua vòng HyDE (tiết kiệm 1 lượt LLM + 1 lượt rerank).
     HYDE_MIN_TOP_SCORE: float = 0.03
     RETRIEVAL_TOP_K: int = 20    # số chunk lấy từ Qdrant trước rerank
+    # Số chunk "continuation" (không có article_number) tối đa được gom vào 1 Điều
+    # khi tra cứu theo article_lookup. Ngăn gom nhầm nội dung các Điều kế tiếp chưa có metadata.
+    ARTICLE_MAX_CONTINUATION_CHUNKS: int = 12
 
     # ── Hybrid Search (dense + sparse / BM25) ────────────────────────
     # True → BGE-M3 sparse vectors được index và search song song với dense.
@@ -117,9 +120,14 @@ class Settings(BaseSettings):
     WEB_SEARCH_SNIPPET_CHARS: int = 1200
     WEB_SEARCH_DEPTH: str = "basic"   # "advanced" → trích xuất tốt hơn nhưng tốn gấp đôi credit Tavily
     # Chỉ giữ kết quả web có điểm rerank (câu hỏi vs đoạn trích) ≥ ngưỡng này — loại kết quả lạc đề.
-    WEB_MIN_RELEVANCE: float = 0.15
-    WEB_SENTENCE_MIN: float = 0.10     # chỉ giữ CÂU web có điểm liên quan ≥ mức này (tối đa 5 câu/nguồn)
+    # 0.15/0.10 quá thấp → bình luận diễn đàn / bài chia sẻ cá nhân vẫn lọt qua.
+    # 0.35/0.28 loại đủ câu lan man mà vẫn giữ câu pháp luật cốt lõi.
+    WEB_MIN_RELEVANCE: float = 0.35
+    WEB_SENTENCE_MIN: float = 0.28     # chỉ giữ CÂU web có điểm liên quan ≥ mức này (tối đa 5 câu/nguồn)
     WEB_SEARCH_DOMAINS: str = "thuvienphapluat.vn,vbpl.vn,chinhphu.vn,moj.gov.vn,luatvietnam.vn"
+
+    # ── AI Agent (autonomous planning) ───────────────────────────────
+    AI_AGENT_URL: str = "http://localhost:8003"
 
     # ── Auth / JWT ────────────────────────────────────────────────────
     SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION"

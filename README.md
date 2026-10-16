@@ -1,3 +1,107 @@
+# RAG-2 + AI Agent — Monorepo
+
+Hệ thống gồm hai service hoạt động cùng nhau:
+
+| Service | Thư mục | Port | Vai trò |
+|---------|---------|------|---------|
+| **RAG-2** | `backend/` + `frontend/` | API: **8000**, UI: **3000** | Hỏi đáp tài liệu pháp luật |
+| **AI Agent** | `ai_agent/` | **8001** | Autonomous Agent — Plan → Execute → Verify → Reflect |
+
+Agent có sẵn `rag_tool` gọi vào RAG-2 (`http://localhost:8000`) để tra cứu tài liệu như một tool.
+
+---
+
+## Cấu trúc monorepo
+
+```
+RAG-2/
+├── backend/        # FastAPI · Celery · PostgreSQL · Qdrant · BGE-M3
+├── frontend/       # Reflex UI (port 3000)
+├── ai_agent/       # AI Autonomous Agent (port 8001)
+│   ├── main.py
+│   ├── requirements.txt
+│   ├── setup.ps1
+│   ├── .env.example
+│   └── ai_agent/           # Package chính
+│       ├── core/           # LLM service, agent state, task understanding
+│       ├── planning/       # Task decomposition, plan generator, dynamic planner
+│       ├── tools/          # web_search, calculator, python, file_reader, rag, …
+│       ├── execution/      # Tool executor, task runner, guard rails
+│       ├── verification/   # Result verifier, reflection, replanner
+│       ├── memory/         # Short-term, long-term (JSON), retrieval
+│       ├── agent_loop/     # Vòng lặp chính, final answer
+│       └── api/            # FastAPI routes
+├── planning/       # Tài liệu thiết kế gốc
+└── docs/
+```
+
+---
+
+## Khởi động
+
+### 1 — Hạ tầng dùng chung
+```bash
+cd backend
+docker compose up -d postgres redis qdrant
+```
+
+### 2 — RAG-2 Backend (port 8000)
+```bash
+cd backend && source .venv/Scripts/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 3 — RAG-2 Frontend (port 3000)
+```bash
+cd frontend && source .venv/Scripts/activate
+reflex run
+```
+
+### 4 — Celery worker (chỉ cần khi upload tài liệu)
+```bash
+cd backend
+celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+```
+
+### 5 — AI Agent (port 8001)
+```bash
+cd ai_agent
+copy .env.example .env    # lần đầu — chỉnh TILAVY_API_KEY nếu cần
+pip install -r requirements.txt
+python main.py            # API server  →  http://localhost:8001/docs
+python main.py --cli      # hoặc CLI
+```
+
+---
+
+## Luồng kết nối
+
+```
+Người dùng
+    │
+    ├─► Reflex UI (3000) ──► RAG-2 API (8000) ──► Qdrant / PostgreSQL
+    │                               ▲
+    └─► AI Agent  (8001) ───────────┘
+          rag_tool gọi RAG-2 khi cần tra cứu tài liệu
+```
+
+---
+
+## Cấu hình ai_agent/.env
+
+| Biến | Giá trị | Ghi chú |
+|------|---------|---------|
+| `RAG_API_URL` | `http://localhost:8000` | Trỏ vào RAG-2 |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Dùng chung Ollama |
+| `MODEL_NAME` | `qwen3:1.7b` | Dùng chung model |
+| `PORT` | `8001` | Agent server port |
+
+---
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!-- README gốc RAG-2                                                   -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+
 # RAG Document QA — Hỏi đáp tài liệu pháp luật
 
 Hệ thống hỏi đáp tài liệu (tập trung văn bản luật tiếng Việt) dựa trên RAG.
@@ -28,7 +132,7 @@ Hệ thống hỏi đáp tài liệu (tập trung văn bản luật tiếng Vi�
 |---------|---------|
 | Python 3.10+ | Dự án đang chạy trên Python 3.10 (Windows) |
 | PostgreSQL 16, Redis 7, Qdrant | Chạy bằng Docker Compose **hoặc** cài native (Memurai thay Redis trên Windows) |
-| Ollama | `ollama pull qwen2.5:3b` |
+| Ollama | `ollama pull qwen3:1.7b` |
 | Git | |
 | GPU NVIDIA (khuyến nghị) | Dùng cho reranker (`RERANKER_DEVICE=cuda`) — rerank 20 đoạn trên CPU mất ~60 s, trên GPU chỉ vài giây |
 
@@ -97,7 +201,7 @@ alembic upgrade head
 ### 5. LLM
 
 ```bash
-ollama pull qwen2.5:3b
+ollama pull qwen3:1.7b
 ```
 
 BGE-M3 và reranker tự tải từ HuggingFace ở lần chạy đầu (~2 GB mỗi model).
@@ -217,7 +321,7 @@ Câu hỏi
 | Biến | Mặc định | Mô tả |
 |------|----------|-------|
 | `SECRET_KEY` | ⚠️ cần đổi | Khóa ký JWT |
-| `OLLAMA_MODEL` | `qwen2.5:3b` | Model trong Ollama |
+| `OLLAMA_MODEL` | `qwen3:1.7b` | Model trong Ollama |
 | `EMBEDDING_DEVICE` | `cpu` | `cpu` hoặc `cuda` |
 | `RERANKER_DEVICE` | `cpu` | `cuda` nếu torch có CUDA (rất khuyến nghị) |
 | `RERANK_MAX_LENGTH` | `384` | Số token tối đa mỗi cặp khi rerank (nhỏ hơn = nhanh hơn) |

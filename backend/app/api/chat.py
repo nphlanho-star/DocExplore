@@ -5,11 +5,14 @@ import asyncio
 import difflib
 import functools
 import json
+import os
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
+
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -908,12 +911,18 @@ async def _fetch_article_chunks_from_db(
     db: AsyncSession,
 ) -> list[RankedChunk]:
     """
-    Lấy TẤT CẢ chunk của 1 Điều cụ thể từ DB (theo article_number trong
-    chunk_metadata), gộp thành 1 RankedChunk đầy đủ mỗi document — không
-    qua similarity search, không bị cắt bởi reranker top_k.
+    Lấy TẤT CẢ chunk của 1 Điều cụ thể từ DB — không qua similarity search,
+    không bị cắt bởi reranker top_k.
 
-    Dùng cho câu hỏi "Điều X quy định gì?" để đảm bảo không bỏ sót khoản
-    nào, thay vì phụ thuộc vào similarity search chỉ lấy top-K chunk.
+    Hai trường hợp chunk được thu thập:
+    1. Chunk có article_number khớp với article_number yêu cầu.
+    2. Chunk TIẾP THEO (continuation) không có article_number — xảy ra khi
+       chunker tách Điều dài (nhiều khoản) thành nhiều đoạn, chỉ gán
+       article_number cho đoạn đầu tiên.  Thu thập cho đến khi gặp chunk có
+       article_number mới (khác bài đang lấy) hoặc hết tài liệu.
+
+    Trả về từng chunk RIÊNG (không merge) để context-budget (_apply_context_budget)
+    có thể cắt theo đơn vị khoản thay vì cắt giữa chừng 1 chunk khổng lồ.
     """
     result = await db.execute(
         select(DocumentChunk, Document.original_filename)
@@ -923,47 +932,78 @@ async def _fetch_article_chunks_from_db(
     )
     rows = result.all()
 
-    groups: list[RankedChunk] = []
-    current_parts: list[str] = []
-    current_meta: dict = {}
-    current_doc: uuid.UUID | None = None
+    # Giới hạn số chunk continuation (không có article_number) tối đa cho 1 Điều.
+    # Phòng trường hợp chunker không gán metadata cho nhiều chunk kế tiếp → tránh
+    # gom nhầm nội dung các Điều khác vào Điều đang tra cứu.
+    _MAX_CONTINUATION = settings.ARTICLE_MAX_CONTINUATION_CHUNKS
 
-    def _flush_group():
-        if current_parts:
-            groups.append(RankedChunk(
-                original_id=str(current_meta.get("first_chunk_id", "")),
-                content="\n".join(current_parts),
-                rerank_score=1.0,
-                payload=dict(current_meta),
-            ))
+    out: list[RankedChunk] = []
+    in_target: bool = False
+    current_doc: uuid.UUID | None = None
+    base_payload: dict = {}
+    prev_chunk_index: int | None = None   # theo dõi tính liên tục của chunk_index
+    continuation_count: int = 0            # đếm chunk continuation (art == "")
 
     for chunk, filename in rows:
         meta = chunk.chunk_metadata or {}
         art = str(meta.get("article_number") or "").strip()
-        if art.lower() != article_number.lower():
-            continue
 
-        if current_doc != chunk.document_id and current_parts:
-            _flush_group()
-            current_parts = []
+        # Sang tài liệu khác → reset trạng thái
+        if chunk.document_id != current_doc:
+            current_doc = chunk.document_id
+            in_target = False
+            prev_chunk_index = None
+            continuation_count = 0
 
-        if not current_parts:
-            current_meta = {
+        if art.lower() == article_number.lower():
+            # Chunk đầu tiên (hoặc chunk đầu trang mới) của Điều cần lấy
+            in_target = True
+            continuation_count = 0
+            base_payload = {
                 "document_id": str(chunk.document_id),
                 "original_filename": filename,
-                "chunk_index": chunk.chunk_index,
-                "page_number": chunk.page_number,
-                "chapter": str(meta.get("chapter") or ""),
                 "article_number": art,
                 "article_title": str(meta.get("article_title") or ""),
-                "first_chunk_id": chunk.id,
+                "chapter": str(meta.get("chapter") or ""),
             }
-            current_doc = chunk.document_id
+        elif in_target and art and art.lower() != article_number.lower():
+            # Điều mới bắt đầu → dừng thu thập cho Điều hiện tại
+            in_target = False
+            prev_chunk_index = None
+            continuation_count = 0
+        elif in_target and not art:
+            # Chunk continuation (không có article_number):
+            # 1) chunk_index phải liên tục (không bị nhảy gap)
+            # 2) không vượt quá _MAX_CONTINUATION chunk
+            if prev_chunk_index is not None and chunk.chunk_index != prev_chunk_index + 1:
+                in_target = False
+                prev_chunk_index = None
+                continuation_count = 0
+            elif continuation_count >= _MAX_CONTINUATION:
+                in_target = False
+                prev_chunk_index = None
+                continuation_count = 0
+            else:
+                continuation_count += 1
 
-        current_parts.append(chunk.content)
+        if in_target:
+            prev_chunk_index = chunk.chunk_index
+            out.append(RankedChunk(
+                original_id=str(chunk.id),
+                content=chunk.content,
+                rerank_score=1.0,
+                payload={
+                    **base_payload,
+                    "chunk_index": chunk.chunk_index,
+                    "page_number": chunk.page_number,
+                },
+            ))
 
-    _flush_group()
-    return groups
+    logger.info(
+        f"[article_lookup] Điều {article_number}: tìm thấy {len(out)} chunk từ DB"
+        + (f" ({', '.join(str(c.payload.get('chunk_index')) for c in out[:5])}{'…' if len(out) > 5 else ''})" if out else " → sẽ fallback RAG")
+    )
+    return out
 
 
 def _is_single_article_question(question: str) -> bool:
@@ -1141,6 +1181,54 @@ def _pair_articles(groups_a: list, groups_b: list, threshold: float = 0.45) -> l
     return result
 
 
+# ── VERBATIM detection (pháp lý: không được phép paraphrase) ────────────────────
+# Regex thuần — không gọi LLM, không hardcode số điều.
+_VERBATIM_RE = re.compile(
+    r"(nguy\u00ean v\u0103n|n\u00eau nguy\u00ean v\u0103n|tr\u00edch nguy\u00ean v\u0103n|quote|verbatim"
+    r"|tr\u00edch d\u1eabn ch\u00ednh x\u00e1c|copy nguy\u00ean|ch\u00e9p nguy\u00ean|nguy\u00ean si"
+    r"|full text|to\u00e0n v\u0103n|n\u1ed9i dung \u0111\u1ea7y \u0111\u1ee7)",
+    re.I,
+)
+
+
+def _is_verbatim_request(text: str) -> bool:
+    """True khi người dùng yêu cầu trích dẫn NGUYÊN VĂN (pháp lý: không tóm tắt)."""
+    return bool(_VERBATIM_RE.search(text))
+
+
+_VERBATIM_STRIP_RE = re.compile(
+    r"(?i)^(c\u1ee9\s+)?(n\u00eau|tr\u00edch|h\u00e3y|cho t\u00f4i|\u0111\u1ecdc|show me)\s+"
+    r"(nguy\u00ean v\u0103n|nguy\u00ean si|to\u00e0n b\u1ed9 n\u1ed9i dung|full text|to\u00e0n v\u0103n)\s+(c\u1ee7a\s+)?"
+    r"|\bnguy\u00ean v\u0103n\b"
+    r"|\s+(ra \u0111i|\u0111i|nh\u00e9|nha)\s*$"
+)
+
+
+def _clean_verbatim_embed(text: str) -> str:
+    """
+    Loại bỏ các từ 'framing' (nguyên văn, nêu, trích, ra đi…) trước khi embed.
+
+    Vấn đề: embedding "nêu nguyên văn Điều 3" ≠ embedding "Điều 3"
+    → vector search trả về chunk sai hoặc rỗng.
+    Fix: strip framing words, giữ core reference (Điều X, Khoản Y, topic).
+    """
+    s = text.strip()
+    # Xóa ngoặc đơn phụ: (trích dẫn chính xác), ...
+    s = re.sub(r"\([^)]{0,50}\)", "", s)
+    # Xóa prefix framing
+    s = re.sub(
+        r"(?i)^(c\u1ee9\s+)?(n\u00eau|tr\u00edch|h\u00e3y|cho t\u00f4i|\u0111\u1ecdc)\s+"
+        r"(nguy\u00ean v\u0103n|nguy\u00ean si|to\u00e0n b\u1ed9 n\u1ed9i dung|full text|to\u00e0n v\u0103n)\s+(c\u1ee7a\s+)?",
+        "", s,
+    )
+    # Xóa đuôi rác
+    s = re.sub(r"(?i)\s+(ra \u0111i|\u0111i|nh\u00e9|nha|ra)\s*$", "", s)
+    # Xóa cụm "nguyên văn" còn sót
+    s = re.sub(r"(?i)\bnguy\u00ean v\u0103n\b", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) >= 3 else text.strip()
+
+
 # ── Case #10: Conversational RAG ─────────────────────────────────────────────
 
 _FOLLOWUP_MARKERS = (
@@ -1151,6 +1239,8 @@ _FOLLOWUP_MARKERS = (
     "nhất có thể", "ngắn nhất", "hơn đi",
     "ngắn gọn", "ngắn hơn", "dài hơn", "hơn nữa", "súc tích", "rút gọn", "viết lại",
     "bằng bảng", "gạch đầu dòng", "bằng tiếng anh", "bằng tiếng việt",
+    # Verbatim follow-up markers: "điều 3 là gì" → "cứ nêu nguyên văn đi"
+    "nguyên văn", "nêu nguyên văn", "trích nguyên văn", "nguyên văn ra",
     "more detail", "what about", "explain more", "why is that", "shorter", "in english",
 )
 _FOLLOWUP_MAX_WORDS = 3
@@ -1200,6 +1290,21 @@ _CONSTRAINT_SPLIT_RE = re.compile(
     re.IGNORECASE,
 )
 _BRIEF_KEYWORDS = ("ngắn gọn", "ngắn hơn", "súc tích", "vắn tắt", "rút gọn", "ngắn nhất", "nhất có thể")
+
+# System prompt riêng cho nhánh API (web search) — không bắt LLM bám tài liệu upload,
+# thay vào đó tổng hợp từ kết quả Tavily truyền vào.
+SYSTEM_PROMPT_WEB = """Bạn là trợ lý pháp luật thông minh. Người dùng hỏi về thông tin pháp luật
+KHÔNG CÓ trong tài liệu đã upload — câu trả lời phải dựa trên kết quả tìm kiếm từ web được cung cấp bên dưới.
+
+Quy tắc:
+1. Tổng hợp thông tin từ các nguồn web đã cho, trả lời rõ ràng, súc tích.
+2. Nêu rõ số thứ tự nguồn khi trích dẫn (VD: "Theo nguồn 1...", "Nguồn 2 cho biết...").
+3. Nếu các nguồn mâu thuẫn nhau, nêu cả 2 quan điểm và chỉ ra điểm khác biệt.
+4. Nếu không đủ thông tin để trả lời chắc chắn, nói rõ giới hạn đó.
+5. KHÔNG bịa thêm thông tin ngoài những gì có trong nguồn.
+6. Trả lời bằng cùng ngôn ngữ với câu hỏi (tiếng Việt nếu hỏi tiếng Việt).
+7. KHÔNG lặp lại câu hỏi, KHÔNG thêm tiền tố 'Trả lời:' hay 'Câu trả lời:'.
+"""
 _EXTREME_BRIEF_KEYWORDS = ("ngắn nhất", "nhất có thể", "cực ngắn")
 _HANDLED_CONSTRAINT_WORDS = {
     "không", "cần", "được", "đề", "cập", "tới", "đến", "nhắc", "mà", "đâu", "nhé", "nha",
@@ -1298,20 +1403,59 @@ def _find_articles_with_topic(groups: list, topic: str, also: list[str] | None =
     '''
     Quét CODE (không bỏ sót) các Điều có chứa cụm chủ đề hoặc các từ liên quan do LLM gợi ý.
     Trả [(group, tổng số lần nhắc)]; group.payload["matched"] ghi các cụm đã khớp.
+
+    Fallback 2 lớp khi cụm ghép không tìm thấy gì:
+      Lớp 1 — "mua chung cư": cũng thử "chung cư" (xóa từ đầu danh sách nếu là động từ ngắn)
+      Lớp 2 — thử từng từ quan trọng (≥ 3 ký tự, không phải giới từ/liên từ)
+    Tránh bỏ sót bài luật dùng cụm từ gần nghĩa ("chung cư cao tầng", "nhà ở chung cư"…).
     '''
     import unicodedata
+    _VI_FUNC = {
+        "mua", "bán", "cho", "của", "với", "các", "những", "mọi", "tất", "cả",
+        "từ", "đến", "trong", "ngoài", "trên", "dưới", "về", "theo", "qua",
+        "tại", "khi", "nếu", "thì", "mà", "và", "hay", "hoặc", "cùng",
+        "phải", "được", "bị", "làm", "này", "đó", "đây",
+    }
     norm = lambda s: " ".join(unicodedata.normalize("NFC", s).lower().split())
+
+    def _scan(grps, terms_):
+        out = []
+        for g in grps:
+            if not str(g.payload.get("article_number") or "").strip():
+                continue
+            text = norm(g.content)
+            counts = {t: text.count(t) for t in terms_}
+            matched = [t for t, c in counts.items() if c]
+            if matched:
+                g.payload = {**g.payload, "matched": matched}
+                out.append((g, sum(counts.values())))
+        return out
+
     terms = [norm(topic)] + [norm(x) for x in (also or [])]
-    hits = []
-    for g in groups:
-        if not str(g.payload.get("article_number") or "").strip():
-            continue   # chỉ liệt kê các Điều thật sự
-        text = norm(g.content)
-        counts = {t: text.count(t) for t in terms}
-        matched = [t for t, c in counts.items() if c]
-        if matched:
-            g.payload = {**g.payload, "matched": matched}
-            hits.append((g, sum(counts.values())))
+    hits = _scan(groups, terms)
+
+    if not hits:
+        # Lớp 1: cụm từ ghép → thử không có từ đầu tiên nếu đó là động từ ngắn
+        # "mua chung cư" → thêm "chung cư"; "xây dựng nhà ở" → thêm "nhà ở"
+        topic_words = norm(topic).split()
+        if len(topic_words) >= 2 and topic_words[0] in _VI_FUNC:
+            suffix = " ".join(topic_words[1:])
+            extra_terms = [suffix] + [norm(x) for x in (also or [])]
+            hits = _scan(groups, extra_terms)
+            if hits:
+                logger.debug(f"[find_topic] fallback L1: '{topic}' → '{suffix}', {len(hits)} hit(s)")
+
+    if not hits:
+        # Lớp 2: thử từng từ quan trọng riêng lẻ (≥ 3 ký tự, không phải từ chức năng)
+        topic_words = norm(topic).split()
+        kw = [w for w in topic_words if len(w) >= 3 and w not in _VI_FUNC]
+        also_kw = [norm(x) for x in (also or []) if len(norm(x)) >= 3]
+        kw = list(dict.fromkeys(kw + also_kw))   # dedup, giữ thứ tự
+        if kw and kw != [norm(topic)]:
+            hits = _scan(groups, kw)
+            if hits:
+                logger.debug(f"[find_topic] fallback L2: '{topic}' → {kw}, {len(hits)} hit(s)")
+
     return hits
 
 
@@ -1411,6 +1555,10 @@ def _validate_plan(plan: dict | None, user_texts: list[str], question: str) -> d
 
     if action == "find":
         topic = " ".join(str(plan.get("topic") or "").lower().split())
+        # Nếu chủ đề là "điều N" (số bài cụ thể), người dùng đang hỏi nội dung của điều đó
+        # chứ không phải liệt kê các điều đề cập chủ đề → trả None để _is_single_article_question xử lý.
+        if re.fullmatch(r"điều\s*\d+[a-z]?", topic, re.IGNORECASE):
+            return None
         # Chủ đề phải CHÉP NGUYÊN từ câu hỏi (không cho LLM tự nghĩ ra) và câu phải có dấu hiệu "tìm/liệt kê"
         # Chủ đề có thể nằm ở câu hiện tại HOẶC các câu hỏi trước (câu nối tiếp "liệt kê đầy đủ đi")
         _ctx = " ".join(" ".join(user_texts).lower().split())
@@ -1529,14 +1677,39 @@ def _is_exclusion_followup(text: str) -> bool:
     return bool(_EXCLUSION_RE.search(text)) and bool(_ARTICLE_LIST_RE.search(text.lower()))
 
 
+_EXPLICIT_ARTICLE_RE = re.compile(r"điều\s*\d+|khoản\s*\d+", re.IGNORECASE)
+
+# Markers chỉ là chỉ thị CÁCH trả lời (verbatim/format), KHÔNG phải tham chiếu ngữ cảnh.
+# Khi câu đã có số điều cụ thể, những markers này KHÔNG đủ để coi câu là followup.
+_VERBATIM_INSTRUCTION_MARKERS = frozenset({
+    "nguyên văn", "nêu nguyên văn", "trích nguyên văn", "nguyên văn ra",
+    "ngắn gọn", "ngắn hơn", "dài hơn", "súc tích", "rút gọn", "viết lại",
+    "bằng bảng", "gạch đầu dòng", "bằng tiếng anh", "bằng tiếng việt",
+    "shorter", "in english",
+})
+# Markers thực sự tham chiếu ngữ cảnh lượt trước — dùng khi câu có số điều cụ thể
+_CONTEXT_REF_MARKERS = tuple(
+    m for m in _FOLLOWUP_MARKERS if m not in _VERBATIM_INSTRUCTION_MARKERS
+)
+
+
 def _looks_like_followup(question: str) -> bool:
     """
     Câu hỏi có phụ thuộc vào ngữ cảnh trước không? Chỉ khi có dấu hiệu rõ (từ
     tham chiếu kiểu "chi tiết hơn", "thì sao"... hoặc cực ngắn) mới xử lý nối
     tiếp — câu hỏi đã đầy đủ ý thì giữ nguyên, KHÔNG gọi LLM viết lại vô ích
     (vừa tốn thời gian vừa có rủi ro model nhỏ làm méo câu hỏi gốc).
+
+    Quan trọng: câu đã có số điều/khoản cụ thể ("điều 3", "điều 3 nguyên văn")
+    là câu tra cứu độc lập — KHÔNG xử lý như followup chỉ vì ngắn hoặc có
+    "nguyên văn" (đó là chỉ thị cách trả lời, không phải reference lượt trước).
+    Nếu không, concat fallback lấy câu cũ ("nói điều 4...") làm chủ đề → sai.
     """
     q = f" {question.lower().strip()} "
+    if _EXPLICIT_ARTICLE_RE.search(question):
+        # Có số điều/khoản cụ thể → chỉ là followup khi có marker tham chiếu thực sự
+        # ("chi tiết hơn", "tại sao"...) — KHÔNG phải chỉ vì ngắn hay có "nguyên văn".
+        return any(m in q for m in _CONTEXT_REF_MARKERS) or _is_exclusion_followup(question)
     return (
         any(m in q for m in _FOLLOWUP_MARKERS)
         or len(question.split()) <= _FOLLOWUP_MAX_WORDS
@@ -2042,6 +2215,8 @@ async def query_stream(
                     if all(w in _qw for w in re.findall(r"\w+", plan["topic"])):
                         _wants_list = await llm_service.confirm_list_request(body.question)
                         logger.info(f"[planner] xác nhận yêu cầu danh sách → {_wants_list}")
+                        # Chỉ override khi model trả lời RÕ RÀNG False (không phải list).
+                        # None = không chắc → tin planner, giữ find.
                         if _wants_list is False:
                             plan.update({"action": "qa", "topic": "", "also": [], "question": ""})
 
@@ -2127,7 +2302,20 @@ async def query_stream(
             if summary_intent and not plan:
                 summary_intent = await _confirm_summary_intent(question)
             if plan:
-                summary_intent = plan["action"] == "summary"
+                # Guard: model nhỏ hay nhầm "đầy đủ điều 3", "toàn bộ điều 5"... là summary.
+                # Nhưng nếu câu hỏi đã xác định rõ 1 Điều cụ thể, nên dùng article_lookup
+                # (lấy toàn bộ content Điều đó từ DB) thay vì summary pipeline (chỉ lấy gist ngắn).
+                _plan_says_summary = plan["action"] == "summary"
+                _is_single_art = _is_single_article_question(question)
+                if _plan_says_summary and _is_single_art:
+                    # Không cho planner force summary — dùng article_lookup thay thế
+                    logger.info(
+                        f"[route-guard] planner=summary nhưng câu hỏi là single-article "
+                        f"({question[:60]!r}) → override → article_lookup"
+                    )
+                    summary_intent = False
+                else:
+                    summary_intent = _plan_says_summary
                 excluded_articles = set(plan["exclude"])
                 unhandled_note = ""
             # ── LLM fallback router: chỉ khi câu KHÔNG khớp keyword nào rõ ràng
@@ -2236,13 +2424,186 @@ async def query_stream(
             # cần đọc chúng.
             candidates: list = []
             ranked: list = []
-            embed_text = question
+            # Strip 'nguyên văn', 'nêu', 'ra đi'… khỏi query trước khi embed
+            # để vector search tìm đúng nội dung, không bị lạc đề bởi intent word.
+            embed_text = _clean_verbatim_embed(question)
+            if embed_text != question:
+                logger.info("[verbatim] embed_text cleaned: %r → %r", question[:60], embed_text[:60])
             full_summary_used = False
             _cstat = None   # thống kê mức context (chỉ có ở nhánh RAG thường)
             article_lookup_used = False   # Case mới: tra cứu trực tiếp 1 Điều
             find_topic = plan["topic"] if (plan and plan["action"] == "find") else ""
             find_used = False
             find_hits: list = []
+
+            # ── Phát hiện câu hỏi "ngoài X ra / còn luật nào nữa / luật nào khác"
+            # Người dùng tường minh yêu cầu thông tin NGOÀI tài liệu hiện có.
+            # → bỏ nhánh find (để không liệt kê lại Điều đã có), buộc web search.
+            _BEYOND_DOCS_RE = re.compile(
+                r"ngoài\s+(?:\S+\s+){1,6}ra\b"                                           # "ngoài luật X ra"
+                r"|còn\s+(?:(?:bộ\s+)?luật|quy\s+định|văn\s+bản|pháp\s+luật)\s+nào\s+(?:nữa|khác)"  # "còn luật nào nữa"
+                r"|có\s+(?:(?:bộ\s+)?luật|quy\s+định)\s+nào\s+(?:khác|nữa)"              # "có luật nào khác không"
+                r"|(?:(?:bộ\s+)?luật|quy\s+định)\s+nào\s+(?:nữa|khác)\s+(?:cần|nên|phải|không)",  # "luật nào nữa cần biết"
+                re.I,
+            )
+            _force_web_search = bool(_BEYOND_DOCS_RE.search(body.question))
+            if _force_web_search:
+                find_topic = ""   # bỏ qua nhánh find để không liệt kê lại Điều đã có
+                if plan:
+                    plan = {**plan, "action": "qa", "topic": ""}
+                logger.info(f"[beyond_docs] câu hỏi vượt tài liệu → force web search: {body.question[:80]!r}")
+            # ── 3-WAY ROUTER ─────────────────────────────────────────────────────
+            # Phân loại câu hỏi thành 3 nhánh TRƯỚC KHI vào pipeline chi tiết:
+            #   RAG_DOC  → luồng hiện tại (tiếp tục bên dưới)
+            #   API      → Tavily web search ngay, trả kết quả rồi return
+            #   PLANNING → thông báo chuyển agent, gợi ý dùng ai-agent endpoint
+            #
+            # Chỉ gọi classifier khi:
+            # - câu không phải summary/compare/find (đã có nhánh riêng)
+            # - câu không phải force_web_search (đã rõ)
+            # - câu không phải single-article (đã rõ là RAG_DOC)
+            # - tavily được bật (không gọi API branch khi không có key)
+            _skip_3way = (
+                summary_intent
+                or _is_compare_request(question)
+                or _force_web_search
+                or _is_single_article_question(question)
+                or bool(find_topic)
+            )
+            _3way = ""  # khởi tạo; được set lại bên trong if not _skip_3way bên dưới
+            if not _skip_3way:
+                _has_docs = bool(search_doc_ids)
+                _3way = await llm_service.classify_query_3way(question, has_doc_context=_has_docs)
+                logger.info(f"[3way-router] {_3way}: {question[:80]!r}")
+
+                if _3way == "PLANNING":
+                    # Gọi AI Agent service (port 8003) để xử lý tác vụ lập kế hoạch.
+                    # Nếu agent không khởi động / timeout → fallthrough sang RAG thường.
+                    _agent_url = settings.AI_AGENT_URL.rstrip("/") + "/agent/run"
+                    try:
+                        async with httpx.AsyncClient(timeout=120) as _ac:
+                            _agent_resp = await _ac.post(
+                                _agent_url,
+                                json={"message": body.question, "context": {}},
+                            )
+                            _agent_resp.raise_for_status()
+                            _agent_data = _agent_resp.json()
+                        _agent_answer = _agent_data.get("answer") or ""
+                        _agent_sources = _agent_data.get("sources") or []
+                        logger.info(
+                            f"[agent] iterations={_agent_data.get('iterations')} "
+                            f"tools={_agent_data.get('tools_used')} "
+                            f"sources={len(_agent_sources)}"
+                        )
+                        if _agent_answer:
+                            _sse_agent_sources = [
+                                {"title": s, "url": s, "document_name": s,
+                                 "chunk_index": 0, "page_number": None, "score": None}
+                                for s in _agent_sources
+                            ]
+                            yield _sse({"type": "sources", "sources": _sse_agent_sources})
+                            # Emit danh sách tool đã dùng để UI hiện badge
+                            _tools_used = _agent_data.get("tools_used") or []
+                            if _tools_used:
+                                yield _sse({"type": "tools_used", "tools": _tools_used})
+                            yield _sse({"type": "token", "content": _agent_answer})
+                            chat_session = await _get_or_create_session(body.session_id, current_user, db)
+                            db.add(ChatMessage(session_id=chat_session.id, role="user", content=body.question))
+                            _am = ChatMessage(
+                                session_id=chat_session.id, role="assistant",
+                                content=_agent_answer, sources=_sse_agent_sources,
+                                retrieval_metadata={
+                                    "route": "PLANNING",
+                                    "agent_iterations": _agent_data.get("iterations"),
+                                },
+                            )
+                            db.add(_am)
+                            await db.flush()
+                            if not chat_session.title:
+                                chat_session.title = body.question[:80]
+                            await db.commit()
+                            yield _sse({"type": "done", "session_id": str(chat_session.id), "message_id": str(_am.id)})
+                            return
+                    except Exception as _ae:
+                        logger.warning(f"[agent] gọi thất bại ({_ae!r}), fallthrough sang RAG")
+                    # Fallthrough: agent không phản hồi → RAG xử lý bình thường
+
+                if _3way == "API" and tavily_service.is_enabled():
+                    # Web search với Tavily — câu hỏi ngoài tài liệu
+                    yield _sse({"type": "status", "stage": "retrieval", "message": "Đang tra cứu thông tin pháp luật bên ngoài tài liệu…"})
+                    _web_results = await tavily_service.search_legal(question)
+                    if _web_results:
+                        # Tổng hợp câu trả lời từ web results
+                        _web_ctx = "\n\n".join(
+                            f"[Nguồn {i+1}] {r.title}\nURL: {r.url}\n{r.content}"
+                            for i, r in enumerate(_web_results)
+                        )
+                        _web_sources = [
+                            {"title": r.title, "url": r.url, "snippet": r.content[:200]}
+                            for r in _web_results
+                        ]
+                        yield _sse({"type": "sources", "sources": _web_sources})
+                        # Tổng hợp câu trả lời từ web context qua Ollama stream
+                        _web_user_msg = (
+                            f"Dưới đây là kết quả tra cứu từ web về câu hỏi của bạn.\n\n"
+                            f"<tai_lieu>\n{_web_ctx}\n</tai_lieu>\n\n"
+                            f"{question}\n\n"
+                            f"Hãy tổng hợp câu trả lời từ các nguồn trên. Nêu rõ nguồn (số thứ tự) khi trích dẫn."
+                        )
+                        _web_answer_chunks: list[str] = []
+                        async with httpx.AsyncClient(timeout=90) as _cli:
+                            _web_payload = {
+                                "model": settings.OLLAMA_MODEL,
+                                "stream": True,
+                                "messages": [
+                                    {"role": "system", "content": SYSTEM_PROMPT_WEB},
+                                    {"role": "user", "content": _web_user_msg},
+                                ],
+                                "options": {"temperature": 0.1, "top_p": 0.9, "num_predict": 2048, "num_thread": max(1, (os.cpu_count() or 4) - 2)},
+                            }
+                            async with _cli.stream("POST", f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat", json=_web_payload) as _resp:
+                                _resp.raise_for_status()
+                                async for _line in _resp.aiter_lines():
+                                    if not _line.strip():
+                                        continue
+                                    try:
+                                        _d = json.loads(_line)
+                                        _tok = _d.get("message", {}).get("content", "")
+                                        if _tok:
+                                            _web_answer_chunks.append(_tok)
+                                            yield _sse({"type": "token", "content": _tok})
+                                        if _d.get("done"):
+                                            break
+                                    except json.JSONDecodeError:
+                                        continue
+                        _web_answer = "".join(_web_answer_chunks)
+                    else:
+                        # Tavily không trả về gì → fallback thông báo
+                        _web_answer = (
+                            "Tôi không tìm thấy thông tin phù hợp từ các nguồn pháp luật bên ngoài. "
+                            "Nếu câu hỏi liên quan đến tài liệu bạn đã upload, hãy hỏi trực tiếp về nội dung tài liệu đó."
+                        )
+                        yield _sse({"type": "sources", "sources": []})
+                        yield _sse({"type": "token", "content": _web_answer})
+
+                    chat_session = await _get_or_create_session(body.session_id, current_user, db)
+                    db.add(ChatMessage(session_id=chat_session.id, role="user", content=body.question))
+                    _am = ChatMessage(
+                        session_id=chat_session.id, role="assistant",
+                        content=_web_answer,
+                        sources=[{"title": r.title, "url": r.url} for r in (_web_results or [])],
+                        retrieval_metadata={"route": "API", "web_results": len(_web_results or [])},
+                    )
+                    db.add(_am)
+                    await db.flush()
+                    if not chat_session.title:
+                        chat_session.title = body.question[:80]
+                    await db.commit()
+                    yield _sse({"type": "done", "session_id": str(chat_session.id), "message_id": str(_am.id)})
+                    return
+                # RAG_DOC hoặc API không có key → tiếp tục luồng thông thường bên dưới
+
+            # ─────────────────────────────────────────────────────────────────
             compare_used = False
             compare_pairs: list = []
             compare_doc_names: tuple[str, str] = ("Tài liệu 1", "Tài liệu 2")
@@ -2453,44 +2814,128 @@ async def query_stream(
                 # Case #06: giới hạn ngân sách context trước khi đưa vào LLM.
                 context_chunks, _cstat = await _compress_context(context_chunks, question)
 
-            # ── Web search (Tavily): CHỈ khi tài liệu không có gì tin cậy VÀ câu hỏi là
-            # câu hỏi PHÁP LUẬT (LLM phân loại). Câu hỏi khác (code, thời tiết…) → không search.
+            # ── Web search (Tavily): khi tài liệu không có gì tin cậy, tự động tra
+            # nguồn pháp luật trên web. Không dùng LLM phân loại (chậm, dễ timeout với
+            # model nhỏ) — thay bằng regex chặn các truy vấn RÕ RÀNG phi-pháp-lý (code,
+            # thời tiết, nấu ăn…). Các câu hỏi pháp luật dạng ngắn/hỏi yes-no như
+            # "vượt đèn đỏ có vi phạm không?" vẫn lọt qua để search. Kết quả web luôn
+            # được reranker lọc lại — câu hỏi thực sự không liên quan sẽ ra kết quả rỗng.
+            _NON_LEGAL_RE = re.compile(
+                r"(viết\s+(code|hàm|script|chương\s*trình)|lập\s*trình|"
+                r"thời\s*tiết|nhiệt\s*độ|dự\s*báo\s*thời\s*tiết|"
+                r"nấu\s*(ăn|phở|bún|cơm|canh)|công\s*thức\s*nấu|"
+                r"giá\s*vàng|tỷ\s*giá|chứng\s*khoán|giá\s*bitcoin|"
+                r"bài\s*hát|ca\s*sĩ|phim\s*(gì|nào|hay)|"
+                r"toán\s*(học)?|giải\s*phương\s*trình|tính\s+(diện\s*tích|thể\s*tích)|"
+                r"translate|dịch\s+(sang|ra)\s+tiếng)",
+                re.I,
+            )
             if _cstat:
                 logger.info(f"[context] {_cstat['orig_chars']} ký tự tìm được / ngưỡng {_cstat['budget_chars']} → dùng {_cstat['used_chars']}")
-            web_results: list = []
+
+            # ── Bước suy luận sau RAG rỗng: web_search hay planning? ─────────────
+            # Kiến trúc: (1) thử RAG trước → (2) nếu rỗng, LLM suy luận xem nên
+            # web search (tra cứu đơn giản) hay planning (tác vụ phức tạp nhiều bước).
+            # _3way == "PLANNING" đã được xử lý trên → chỉ re-classify khi chưa thử.
             if (
                 not context_chunks
+                and not _force_web_search
+                and _3way != "PLANNING"           # tránh gọi agent lần 2 nếu đã thử
+                and not _is_meta_document_question(question)
+                and not _NON_LEGAL_RE.search(question)
+                and getattr(settings, "AI_AGENT_URL", None)
+            ):
+                # LLM suy luận: với context "tài liệu không có gì", nên web hay planning?
+                _after_rag_route = await llm_service.classify_query_3way(
+                    question, has_doc_context=False
+                )
+                logger.info(f"[after-rag-recheck] {_after_rag_route}: {question[:80]!r}")
+
+                if _after_rag_route == "PLANNING":
+                    # Tác vụ phức tạp → chuyển sang AI Agent để lập kế hoạch đúng
+                    yield _sse({"type": "status", "stage": "agent",
+                                "message": "Câu hỏi cần phân tích nhiều bước — đang lập kế hoạch tra cứu…"})
+                    _agent_url_r = settings.AI_AGENT_URL.rstrip("/") + "/agent/run"
+                    try:
+                        async with httpx.AsyncClient(timeout=120) as _ac_r:
+                            _resp_r = await _ac_r.post(
+                                _agent_url_r,
+                                json={"message": body.question, "context": {}},
+                            )
+                            _resp_r.raise_for_status()
+                            _data_r = _resp_r.json()
+                        _ans_r = _data_r.get("answer") or ""
+                        if _ans_r:
+                            _src_r = _data_r.get("sources") or []
+                            _sse_src_r = [
+                                {"title": s, "url": s, "document_name": s,
+                                 "chunk_index": 0, "page_number": None, "score": None}
+                                for s in _src_r
+                            ]
+                            yield _sse({"type": "sources", "sources": _sse_src_r})
+                            _tu_r = _data_r.get("tools_used") or []
+                            if _tu_r:
+                                yield _sse({"type": "tools_used", "tools": _tu_r})
+                            yield _sse({"type": "token", "content": _ans_r})
+                            chat_session = await _get_or_create_session(body.session_id, current_user, db)
+                            db.add(ChatMessage(session_id=chat_session.id, role="user", content=body.question))
+                            _am_r = ChatMessage(
+                                session_id=chat_session.id, role="assistant",
+                                content=_ans_r, sources=_sse_src_r,
+                                retrieval_metadata={
+                                    "route": "PLANNING_AFTER_RAG",
+                                    "agent_iterations": _data_r.get("iterations"),
+                                },
+                            )
+                            db.add(_am_r)
+                            await db.flush()
+                            if not chat_session.title:
+                                chat_session.title = body.question[:80]
+                            await db.commit()
+                            yield _sse({"type": "done", "session_id": str(chat_session.id), "message_id": str(_am_r.id)})
+                            return
+                        logger.info("[after-rag-recheck] agent trả rỗng → fallthrough web_search")
+                    except Exception as _ae_r:
+                        logger.warning(f"[after-rag-recheck] agent thất bại ({_ae_r!r}) → fallthrough web_search")
+                # API hoặc RAG_DOC (không có gì để rag) → tiếp tục xuống web_search bên dưới
+
+            web_results: list = []
+            if (
+                (not context_chunks or _force_web_search)
                 and tavily_service.is_enabled()
                 and not _is_meta_document_question(question)
+                and not _NON_LEGAL_RE.search(question)
             ):
-                if await llm_service.is_legal_question(question):
-                    yield _sse({"type": "status", "stage": "web", "message": "Tài liệu không có thông tin — đang tra cứu nguồn pháp luật trên web…"})
-                    web_results = await tavily_service.search_legal(question)
-                    if web_results:
-                        # Lọc LẠC ĐỀ theo từng CÂU: chấm điểm câu web với câu hỏi bằng reranker, chỉ giữ câu liên quan;
-                        # nguồn không có câu nào đủ điểm bị loại; tối đa 3 nguồn tốt nhất.
-                        import dataclasses as _dc
-                        _units = [(i, ln) for i, r in enumerate(web_results) for ln in r.content.splitlines() if ln.strip()][:80]
-                        _sc = await _run_sync(reranker_service.score_texts, question, [ln for _, ln in _units])
-                        _per: dict[int, list] = {}
-                        for (i, ln), s_ in zip(_units, _sc):
-                            _per.setdefault(i, []).append((s_, ln))
-                        _kept = []
-                        for i, r in enumerate(web_results):
-                            items = _per.get(i, [])
-                            best = max((s_ for s_, _ in items), default=0.0)
-                            logger.info(f"[web_search] nguồn {i + 1}: điểm câu tốt nhất {best:.2f}")
-                            if best < settings.WEB_MIN_RELEVANCE:
-                                continue
-                            top = sorted((x for x in items if x[0] >= settings.WEB_SENTENCE_MIN), key=lambda x: x[0], reverse=True)[:5]
-                            keep_set = {ln for _, ln in top}
-                            lines = [ln for ln in r.content.splitlines() if ln in keep_set]   # giữ thứ tự gốc
-                            if lines:
-                                _kept.append((best, _dc.replace(r, content="\n".join(lines))))
-                        _kept.sort(key=lambda x: x[0], reverse=True)
-                        web_results = [r for _, r in _kept[:3]]
-                else:
-                    logger.info("[web_search] bỏ qua: không phải câu hỏi pháp luật")
+                _web_msg = (
+                    "Câu hỏi vượt phạm vi tài liệu — đang tra cứu luật liên quan trên web…"
+                    if _force_web_search else
+                    "Tài liệu không có thông tin — đang tra cứu nguồn pháp luật trên web…"
+                )
+                yield _sse({"type": "status", "stage": "web", "message": _web_msg})
+                web_results = await tavily_service.search_legal(question)
+                if web_results:
+                    # Lọc LẠC ĐỀ theo từng CÂU: chấm điểm câu web với câu hỏi bằng reranker, chỉ giữ câu liên quan;
+                    # nguồn không có câu nào đủ điểm bị loại; tối đa 3 nguồn tốt nhất.
+                    import dataclasses as _dc
+                    _units = [(i, ln) for i, r in enumerate(web_results) for ln in r.content.splitlines() if ln.strip()][:80]
+                    _sc = await _run_sync(reranker_service.score_texts, question, [ln for _, ln in _units])
+                    _per: dict[int, list] = {}
+                    for (i, ln), s_ in zip(_units, _sc):
+                        _per.setdefault(i, []).append((s_, ln))
+                    _kept = []
+                    for i, r in enumerate(web_results):
+                        items = _per.get(i, [])
+                        best = max((s_ for s_, _ in items), default=0.0)
+                        logger.info(f"[web_search] nguồn {i + 1}: điểm câu tốt nhất {best:.2f}")
+                        if best < settings.WEB_MIN_RELEVANCE:
+                            continue
+                        top = sorted((x for x in items if x[0] >= settings.WEB_SENTENCE_MIN), key=lambda x: x[0], reverse=True)[:5]
+                        keep_set = {ln for _, ln in top}
+                        lines = [ln for ln in r.content.splitlines() if ln in keep_set]   # giữ thứ tự gốc
+                        if lines:
+                            _kept.append((best, _dc.replace(r, content="\n".join(lines))))
+                    _kept.sort(key=lambda x: x[0], reverse=True)
+                    web_results = [r for _, r in _kept[:3]]
 
             sources = _sources_from_ranked(context_chunks)
             # Nguồn web chỉ gửi qua SSE (không lưu vào DB vì schema CitationSource yêu cầu document_id UUID);
@@ -2508,7 +2953,12 @@ async def query_stream(
                 "message": f"Đang đọc {doc_names} và soạn câu trả lời…",
             })
 
-            if find_used:
+            # Khi find_used nhưng không tìm thấy Điều TRONG TÀI LIỆU và đã có kết quả web,
+            # bỏ qua nhánh "find" để luồng `else` bên dưới hiển thị web content thay vì
+            # trả về thông báo "không tìm thấy Điều nào" rỗng tuếch.
+            _effective_find = find_used and (bool(find_hits) or not web_results)
+
+            if _effective_find:
                 if not find_hits:
                     full_answer = f"Tôi không tìm thấy Điều nào nhắc tới “{find_topic}” trong tài liệu."
                     yield _sse({"type": "token", "content": full_answer})
@@ -2544,6 +2994,35 @@ async def query_stream(
                             _parts.append(_more)
                             yield _sse({"type": "token", "content": _more})
                     full_answer = "".join(_parts)
+
+            elif context_chunks and (article_lookup_used or _is_verbatim_request(body.question)):
+                # ── VERBATIM path: trả nguyên văn từ DB/RAG, KHÔNG gọi LLM ────────
+                # Kích hoạt khi: (1) article_lookup_used = ta đã lấy đủ nội dung 1 Điều
+                # cụ thể từ DB — không cần LLM format lại thành bullet; hoặc (2) người
+                # dùng yêu cầu "nguyên văn/trích dẫn chính xác".
+                # Pháp lý yêu cầu chính xác tuyệt đối — bypass LLM hoàn toàn,
+                # trả thẳng raw text từ chunk. Không tóm tắt, không paraphrase.
+                _vparts: list[str] = []
+                for _vchunk in context_chunks:
+                    _art_no = _vchunk.payload.get("article_number", "")
+                    _art_title = _vchunk.payload.get("article_title", "")
+                    _doc_name = _vchunk.payload.get("original_filename", "Tài liệu")
+                    if _art_no:
+                        _vheader = f"**Điều {_art_no}" + (f" — {_art_title}" if _art_title else "") + "**\n\n"
+                    else:
+                        _vheader = f"**{_doc_name}**\n\n"
+                    _vcontent = (_vchunk.content or "").strip()
+                    if not _vcontent:
+                        continue
+                    _vblock = _vheader + _vcontent + "\n\n"
+                    _vparts.append(_vblock)
+                    yield _sse({"type": "token", "content": _vblock})
+                if not _vparts:
+                    _msg = "⚠️ Không tìm thấy nội dung trong tài liệu cho yêu cầu này."
+                    yield _sse({"type": "token", "content": _msg})
+                    full_answer = _msg
+                else:
+                    full_answer = "".join(_vparts)
 
             elif full_summary_used:
                 # ── Tóm tắt EXTRACTIVE (trích xuất trực tiếp, KHÔNG gọi LLM) ────
@@ -2792,6 +3271,68 @@ async def query_stream(
 
 
 # ── Session & History ─────────────────────────────────────────────────────────
+
+@router.post("/debug/retrieve")
+async def debug_retrieve(
+    body: QueryRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Công cụ debug retrieval (chỉ khi DEBUG=true): trả về các chunk ứng viên
+    kèm điểm Qdrant (dense/hybrid) và điểm rerank, KHÔNG gọi LLM, không lưu
+    lịch sử. Dùng để chỉnh RERANK_MIN_SCORE / RETRIEVAL_TOP_K theo số liệu.
+    """
+    if not settings.DEBUG:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    accessible = set(await _get_accessible_doc_ids(current_user, db))
+    if body.document_ids:
+        if any(d not in accessible for d in body.document_ids):
+            raise HTTPException(status_code=403, detail="Không có quyền truy cập tài liệu.")
+        doc_ids = body.document_ids
+    else:
+        doc_ids = list(accessible)
+    if not doc_ids:
+        raise HTTPException(status_code=404, detail="Chưa có tài liệu nào.")
+
+    candidates, ranked = await _retrieve_and_rerank(
+        question=body.question,
+        embed_text=body.question,
+        search_doc_ids=doc_ids,
+        explicit_multi_doc=False,
+        top_k=body.top_k,
+        user_id=current_user.id,
+    )
+    rr = {r.original_id: r.rerank_score for r in ranked}
+
+    def _row(c: dict) -> dict:
+        pl = c.get("payload") or {}
+        content = pl.get("content", "")
+        return {
+            "id": c.get("id"),
+            "qdrant_score": round(float(c.get("score", 0.0)), 4),
+            "rerank_score": round(float(rr[c["id"]]), 4) if c.get("id") in rr else None,
+            "kept": c.get("id") in rr
+            and rr[c["id"]] >= settings.RERANK_MIN_SCORE,
+            "document_id": pl.get("document_id"),
+            "title": pl.get("title") or pl.get("article_title"),
+            "chars": len(content),
+            "preview": content[:200],
+        }
+
+    rows = [_row(c) for c in candidates]
+    rows.sort(key=lambda r: (r["rerank_score"] is None, -(r["rerank_score"] or 0)))
+    return {
+        "question": body.question,
+        "hybrid": settings.HYBRID_SEARCH_ENABLED,
+        "rerank_min_score": settings.RERANK_MIN_SCORE,
+        "retrieval_top_k": settings.RETRIEVAL_TOP_K,
+        "n_candidates": len(candidates),
+        "n_kept": sum(1 for r in rows if r["kept"]),
+        "chunks": rows,
+    }
+
 
 @router.get("/sessions", response_model=list[ChatSessionRead])
 async def list_sessions(

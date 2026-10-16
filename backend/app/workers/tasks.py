@@ -124,6 +124,14 @@ def _sync_save_chunks(doc_id: str, chunks_data: list[dict]) -> list[str]:
     return asyncio.run(_save())
 
 
+class EmptyDocumentError(Exception):
+    """Tài liệu không trích xuất được chữ (PDF scan lỗi OCR, file rỗng…).
+    Không retry vì thử lại vẫn cho kết quả rỗng."""
+
+
+MIN_EXTRACTED_CHARS = 20
+
+
 # ── Main pipeline task ────────────────────────────────────────────────────────
 
 @celery_app.task(
@@ -157,6 +165,13 @@ def process_document_pipeline(self, document_id: str) -> dict:
 
         base_text = parse_result.text
         markdown_text = parse_result.markdown
+
+        if len((base_text or "").strip()) < MIN_EXTRACTED_CHARS and \
+                len((markdown_text or "").strip()) < MIN_EXTRACTED_CHARS:
+            raise EmptyDocumentError(
+                "Không trích xuất được nội dung chữ từ tài liệu (file rỗng hoặc "
+                "PDF scan không đọc được). Hãy thử file khác hoặc bản có text."
+            )
 
         # ── Bước 3: OCR (chỉ khi Word có ảnh nhúng) ───────────────────
         logger.info("[3/5] Kiểm tra OCR…")
@@ -266,6 +281,11 @@ def process_document_pipeline(self, document_id: str) -> dict:
             "page_count": parse_result.page_count,
             "word_count": parse_result.word_count,
         }
+
+    except EmptyDocumentError as exc:
+        logger.warning(f"[Pipeline] Document {document_id} rỗng: {exc}")
+        _sync_update_status(document_id, ProcessingStatus.FAILED, error=str(exc))
+        return {"status": "failed", "document_id": document_id, "error": str(exc)}
 
     except Exception as exc:
         error_msg = str(exc)
