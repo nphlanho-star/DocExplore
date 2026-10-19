@@ -68,9 +68,16 @@ async def lifespan(app: FastAPI):
             f"Chạy: ollama pull {settings.OLLAMA_MODEL}"
         )
 
+    # Khởi động AutonomousAgent (PLAN queries: legal review / multi-step)
+    # Lỗi được bắt bên trong — backend vẫn chạy bình thường nếu agent fail
+    from app.services.agent_service import start_agent
+    await start_agent()
+
     yield
 
     logger.info("Đóng engine database…")
+    from app.services.agent_service import stop_agent
+    await stop_agent()
     await engine.dispose()
 
 

@@ -2163,6 +2163,53 @@ async def query_stream(
                 })
                 return
 
+            # ── PLAN routing: legal review / multi-step → AutonomousAgent ──
+            # Classifier chạy bằng regex thuần (không tốn LLM call).
+            # Nếu agent chưa sẵn sàng (Ollama chưa chạy…) → fallthrough RAG.
+            from app.services.agent_service import classify_query, get_agent
+            if classify_query(body.question) == "plan":
+                _agent = get_agent()
+                if _agent is not None:
+                    yield _sse({"type": "status", "stage": "plan",
+                                "message": "Đang lập kế hoạch phân tích pháp lý…"})
+                    try:
+                        from ai_agent.models import RunAgentRequest as _RunAgentRequest
+                        _resp = await _agent.run(_RunAgentRequest(
+                            message=body.question,
+                            session_id=str(body.session_id) if body.session_id else None,
+                        ))
+                        _answer = _resp.answer or ""
+                        yield _sse({"type": "sources", "sources": []})
+                        # Fake-stream theo chunk để frontend render mượt
+                        _CHUNK = 80
+                        for _i in range(0, len(_answer), _CHUNK):
+                            yield _sse({"type": "token", "content": _answer[_i:_i + _CHUNK]})
+                        # Lưu vào chat history
+                        chat_session = await _get_or_create_session(body.session_id, current_user, db)
+                        db.add(ChatMessage(session_id=chat_session.id, role="user",
+                                           content=body.question))
+                        _amsg = ChatMessage(
+                            session_id=chat_session.id, role="assistant",
+                            content=_answer, sources=[],
+                            retrieval_metadata={
+                                "agent_loop": True,
+                                "iterations": _resp.iterations,
+                                "tool_calls": _resp.tool_calls,
+                                "llm_calls": _resp.llm_calls,
+                            },
+                        )
+                        db.add(_amsg)
+                        await db.flush()
+                        if not chat_session.title:
+                            chat_session.title = body.question[:80]
+                        await db.commit()
+                        yield _sse({"type": "done", "session_id": str(chat_session.id),
+                                    "message_id": str(_amsg.id)})
+                        return
+                    except Exception as _agent_err:
+                        logger.warning("[agent] PLAN query failed, fallthrough RAG: %s", _agent_err)
+                        # Không return → tiếp tục xuống RAG pipeline bình thường
+
             # ── Lấy danh sách document được phép ──────────────────────
             explicit_multi_doc = False
             if body.document_ids:
